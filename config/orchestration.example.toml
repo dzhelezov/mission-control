@@ -1,0 +1,101 @@
+# mission-control — orchestration config (shipped defaults; copy to orchestration.toml and edit)
+# Three layers: model catalog (data) → role schema (declared roles/seats) → routing (principles
+# live in docs/routing.md; re-derive assignments from the catalog by those principles).
+
+[deployment]
+control_repo = "you/your-mission-control-instance"   # private clone of this kit = the control repo
+target_repos = ["you/your-project"]                  # where work products (PRs) land
+tick_minutes = 45                                    # remote cadence (cron */45-style)
+journal_issue = "journal"                            # pinned issue label for tick reports
+directive_label = "directive"                        # issues the remote consumes as work
+
+# ── 1) MODEL CATALOG ─ the taste/cost/intelligence matrix, as data ──────────────────────────────
+# cost: higher = cheaper/flatter. intel: unsupervised problem-hardness. taste: code/design/API quality.
+[models.fable]
+id = "claude-fable-5"
+pool = "claude-max"        # subscription on Max; $-metered on API — the scarce judgment resource
+cost = 2
+intel = 9
+taste = 9
+
+[models.opus]
+id = "claude-opus-4-8"
+pool = "claude-max"
+cost = 4
+intel = 7
+taste = 8
+
+[models.sonnet]
+id = "claude-sonnet-5"
+pool = "claude-max"
+cost = 5
+intel = 5
+taste = 7
+
+[models.codex]
+id = "gpt-5.5"             # knob: e.g. "sol" when available on your Codex subscription
+pool = "codex-sub"         # flat plan → $0 marginal; reached via `codex exec`
+cost = 9
+intel = 8
+taste = 5
+
+[models.glm]
+id = "z-ai/glm-5.2"        # via OpenRouter; reached via the `glm` CLI (peers/glm)
+pool = "openrouter"
+cost = 9
+intel = 7
+taste = 8
+
+# ── 2) ROLE SCHEMA ─ roles are declared, seats can be N-wide, escalation is explicit ────────────
+[roles.cto]                 # architecture, roadmap, specs, arbitration, taste-setting — periodic
+kind = "judgment"
+seats = [{ model = "fable", effort = "xhigh" }]
+
+[roles.deep-reasoner]       # the rare hardest single-question dive
+kind = "judgment"
+seats = [{ model = "fable", effort = "max" }]
+
+[roles.orchestrator]        # lean dispatcher + merge gate; the tick loop / the laptop main session
+kind = "dispatch"
+seats = [{ model = "opus", effort = "xhigh" }]
+
+[roles.code]                # DEFAULT implementation = free-pool brain+hands pair
+kind = "implement"
+seats = [
+  { model = "glm",   as = "brain" },   # drafts tasteful code/API/tests (text-only)
+  { model = "codex", as = "hands" },   # applies files, runs tests, iterates (one retry, then back to brain)
+]
+[roles.code.escalation]
+model = "opus"
+effort = "xhigh"
+when = "taste-critical | correctness-critical | pair-stalls"
+
+[roles.review]              # per-PR committee, blind seats, per-seat lenses
+kind = "committee"
+seats = [
+  { model = "glm",   lens = "taste" },
+  { model = "codex", lens = "adversarial-empirical" },
+  { model = "opus",  lens = "judgment", when = "substantive" },
+]
+[roles.review.arbiter]
+model = "fable"
+when = "split | invariant-critical"
+
+[roles.mechanical]          # bulk/boilerplate/formatting/running suites
+kind = "execute"
+seats = [{ model = "codex" }]          # free pool default
+# alternative in-harness seat (near-dominated; enable if you prefer Claude-native mechanical):
+# seats = [{ model = "sonnet", effort = "low" }]
+
+# ── 3) GUARDRAILS (parameterized per deployment; rendered into the remote mission doc) ──────────
+[guardrails]
+human_reserved = [
+  "publish to package registries (until gated release-automation is proven)",
+  "external outreach",
+  "merges to production docs/sites",
+  "spend beyond budget_usd",
+]
+budget_usd = 50
+public_surface_rule = true    # never post infra internals to public repos
+secret_scan = true            # pre-commit/pre-push scans; keys env-file-only (600), never argv
+workflow_scope = "human"      # workflow-file pushes stay human (PAT has no workflow scope)

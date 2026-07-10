@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""glm — one-shot GLM 5.2 peer via OpenRouter.
+
+A second, non-Anthropic pair of eyes for pair-programming and review-committee
+duty. Prompt in, answer out. Zero pip deps (stdlib urllib only) so it ports to
+any box.
+
+Usage:
+  glm "prompt"                     one-shot prompt
+  echo "..." | glm                 read prompt from stdin
+  glm -s "system prompt" "prompt"  set a system prompt
+  glm -f PATH [-f PATH ...] "..."  attach file contents as context
+  cmd | glm -f - "review this"     '-' reads the piped context, prompt from arg
+  glm --effort high|medium|low     reasoning effort (default: high)
+  glm --model z-ai/glm-5.2         override model (default: z-ai/glm-5.2)
+  glm --json                       print the raw JSON response
+  glm --quiet                      suppress the usage/cost line on stderr
+
+Key resolution order:
+  $OPENROUTER_API_KEY  ->  ~/.config/orchestration/openrouter.env
+  ->  ~/ops/secrets/openrouter.env
+"""
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+
+MODEL = "z-ai/glm-5.2"
+ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
+KEY_FILES = [
+    os.path.expanduser("~/.config/orchestration/openrouter.env"),
+    os.path.expanduser("~/ops/secrets/openrouter.env"),
+]
+
+
+def load_key():
+    k = os.environ.get("OPENROUTER_API_KEY")
+    if k:
+        return k.strip()
+    for p in KEY_FILES:
+        try:
+            with open(p) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("OPENROUTER_API_KEY"):
+                        return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except FileNotFoundError:
+            continue
+    sys.exit("glm: no OPENROUTER_API_KEY in env or " + " / ".join(KEY_FILES))
+
+
+def main():
+    args = sys.argv[1:]
+    system = None
+    files = []
+    model = MODEL
+    effort = "high"
+    raw_json = False
+    quiet = False
+    prompt_parts = []
+
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-s", "--system"):
+            i += 1; system = args[i]
+        elif a in ("-f", "--file"):
+            i += 1; files.append(args[i])
+        elif a == "--model":
+            i += 1; model = args[i]
+        elif a == "--effort":
+            i += 1; effort = args[i]
+        elif a == "--json":
+            raw_json = True
+        elif a in ("-q", "--quiet"):
+            quiet = True
+        elif a in ("-h", "--help"):
+            print(__doc__); return
+        else:
+            prompt_parts.append(a)
+        i += 1
+
+    prompt = " ".join(prompt_parts).strip()
+
+    # File / stdin context
+    ctx_blocks = []
+    stdin_data = None
+    if not sys.stdin.isatty():
+        stdin_data = sys.stdin.read()
+    for f in files:
+        if f == "-":
+            if stdin_data is not None:
+                ctx_blocks.append(f"# piped stdin\n{stdin_data}")
+                stdin_data = None
+        else:
+            with open(f) as fh:
+                ctx_blocks.append(f"# file: {f}\n{fh.read()}")
+    # If no prompt given but stdin has data, stdin IS the prompt.
+    if not prompt and stdin_data is not None:
+        prompt = stdin_data.strip()
+        stdin_data = None
+    if not prompt and not ctx_blocks:
+        sys.exit("glm: no prompt (pass an arg, pipe stdin, or -f FILE)")
+
+    user_content = prompt
+    if ctx_blocks:
+        user_content = "\n\n".join(ctx_blocks) + "\n\n---\n\n" + prompt
+
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": user_content})
+
+    body = {
+        "model": model,
+        "messages": messages,
+        "reasoning": {"effort": effort},
+    }
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(
+        ENDPOINT, data=data,
+        headers={
+            "Authorization": "Bearer " + load_key(),
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/subsquid-labs/portal-ponder",
+            "X-Title": "portal-ponder orchestration",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            payload = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        sys.exit(f"glm: HTTP {e.code}: {e.read().decode()[:500]}")
+    except urllib.error.URLError as e:
+        sys.exit(f"glm: network error: {e}")
+
+    if raw_json:
+        print(json.dumps(payload, indent=2)); return
+
+    choice = (payload.get("choices") or [{}])[0]
+    msg = choice.get("message", {}) or {}
+    print(msg.get("content", "").rstrip())
+
+    if not quiet:
+        u = payload.get("usage", {}) or {}
+        cost = u.get("cost")
+        prov = payload.get("provider", "?")
+        rt = (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)
+        sys.stderr.write(
+            f"[glm5.2 via {prov}] in={u.get('prompt_tokens','?')} "
+            f"out={u.get('completion_tokens','?')} reason={rt} "
+            f"cost=${cost if cost is not None else '?'}\n"
+        )
+
+
+if __name__ == "__main__":
+    main()
