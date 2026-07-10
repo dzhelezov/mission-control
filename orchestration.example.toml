@@ -33,7 +33,7 @@ intel = 5
 taste = 7
 
 [models.codex]
-id = "gpt-5.5"             # knob: e.g. "sol" when available on your Codex subscription
+id = "gpt-5.6-sol"         # verified live 2026-07-10 (needs codex CLI >= 0.144); prior default: "gpt-5.5"
 pool = "codex-sub"         # flat plan → $0 marginal; reached via `codex exec`
 cost = 9
 intel = 8
