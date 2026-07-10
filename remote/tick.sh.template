@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# mission-control remote tick — rendered from tick.sh.template at setup ({{VARS}} filled by Claude).
+# Cron-driven autonomous heartbeat: zero-token idle-gate, directive-aware, journaling via gh.
+exec 9>{{OPS_DIR}}/.lock; flock -n 9 || exit 0
+[ -f ~/.claude/.credentials.json ] || { echo "$(date -u +%FT%TZ) no-auth" >> {{OPS_DIR}}/runs/skipped.log; exit 0; }
+OPS={{OPS_DIR}}
+R=$OPS/runs/$(date -u +%Y%m%dT%H%M)
+cd {{PROJECT_DIR}} && git fetch -q origin && git checkout -q main && git pull -q
+
+# ---- zero-token idle gate: skip the LLM when nothing changed -------------------------------
+# Fingerprint includes OPEN DIRECTIVES on the control repo, so a queued directive always runs
+# (the starvation fix). gh failures inject randomness -> fingerprint differs -> RUN (fail open).
+FP=$( {
+  git ls-remote -q origin 2>/dev/null | sort
+  gh pr list --state open --json number,updatedAt 2>/dev/null || echo "GH_PR_FAIL_$RANDOM"
+  gh issue list --state open --json number,updatedAt 2>/dev/null || echo "GH_ISSUE_FAIL_$RANDOM"
+  gh issue list -R {{CONTROL_REPO}} --state open --label "{{DIRECTIVE_LABEL}}" \
+      --json number,updatedAt 2>/dev/null || echo "GH_DIRECTIVE_FAIL_$RANDOM"
+  systemctl is-active {{UNITS}} 2>/dev/null
+} | sha256sum | cut -d' ' -f1 )
+NOW=$(date +%s); LAST=$(cat "$OPS/.tick-lastrun" 2>/dev/null || echo 0)
+if [ -f "$OPS/.tick-force" ]; then
+  rm -f "$OPS/.tick-force"   # manual override: touch {{OPS_DIR}}/.tick-force
+elif [ "$FP" = "$(cat "$OPS/.tick-fp" 2>/dev/null)" ] && [ $((NOW - LAST)) -lt 21600 ]; then
+  echo "$(date -u +%FT%TZ) skip-idle fp=${FP:0:12}" >> "$OPS/runs/ticks.log"; exit 0
+fi
+echo "$FP" > "$OPS/.tick-fp"; echo "$NOW" > "$OPS/.tick-lastrun"
+# --------------------------------------------------------------------------------------------
+
+timeout {{TICK_TIMEOUT_S}} claude -p "Ops tick: follow CLAUDE.local.md exactly — ops sweep first, then consume open '{{DIRECTIVE_LABEL}}' issues on {{CONTROL_REPO}} (priority:high first), then continue the standing mission. Journal a per-tick report as a comment on the '{{CONTROL_REPO}}' issue titled 'journal'. Be surgical; leave durable state (PRs, issue comments) for the next tick." \
+  --model {{MODEL_ID}} --effort {{EFFORT}} --dangerously-skip-permissions > "$R.log" 2>&1
+echo "$(date -u +%FT%TZ) exit=$?" >> "$OPS/runs/ticks.log"

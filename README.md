@@ -1,13 +1,18 @@
 # mission-control
 
-A reproducible two-tier Claude Code orchestration: a human-driven **laptop gateway** + a 24/7
-autonomous **remote session**, coordinated through GitHub-native primitives (issues as directives,
-a pinned journal issue, PRs as work products). Clone it, open Claude Code in it, and it completes
-its own setup — asking for tokens and access only when and where needed.
+A minimal, reproducible two-tier Claude Code orchestration: a human-driven **laptop gateway** +
+a 24/7 autonomous **remote session**, synced through GitHub-native primitives (issues as
+directives, a pinned journal issue, PRs as work products).
 
-**Status: P0 (scaffold).** Read [`DESIGN.md`](DESIGN.md). Shipped defaults are extracted from a
-production deployment; `extracted/` holds the raw battle-tested artifacts pending generalization (P1).
+**Clone it, open Claude Code in it, say "set me up" — `CLAUDE.md` is the installer, doctor, and
+manual.** `orchestration.example.toml` holds the configuration: a model catalog
+(taste/cost/intelligence as editable data), a role schema (multi-seat committees, a brain+hands
+implementation pair, explicit escalation), and guardrails. Defaults are extracted from a
+production deployment and reflect a proven cost/value mix: Claude Max (fable = judgment, opus =
+dispatch/escalation) + Codex sub (hands) + OpenRouter glm (brain/taste seat).
 
-Defaults (all configurable in `config/orchestration.example.toml`): Claude Max (fable = judgment,
-opus = dispatch/escalation) + Codex sub (gpt-5.5 hands) + OpenRouter (glm-5.2 brain/taste-seat);
-3-seat review committee; brain-and-hands implementation pair.
+~10 files, no framework: `agents/` (the roster) · `bin/glm` (OpenRouter peer CLI) ·
+`remote/tick.sh.template` (the idle-gated, directive-aware heartbeat) ·
+`remote/mission.template.md` (the operating doc rendered per project) · `NOTES.md` (design
+rationale). Acceptance bar: the kit must be able to re-provision the deployment it was extracted
+from.
