@@ -29,4 +29,13 @@ echo "$FP" > "$OPS/.tick-fp"; echo "$NOW" > "$OPS/.tick-lastrun"
 
 timeout {{TICK_TIMEOUT_S}} claude -p "Ops tick: follow CLAUDE.local.md exactly — ops sweep first, then consume open '{{DIRECTIVE_LABEL}}' issues on {{CONTROL_REPO}} (priority:high first), then continue the standing mission. Journal a per-tick report as a comment on the '{{CONTROL_REPO}}' issue titled 'journal'. Be surgical; leave durable state (PRs, issue comments) for the next tick." \
   --model {{MODEL_ID}} --effort {{EFFORT}} --dangerously-skip-permissions > "$R.log" 2>&1
-echo "$(date -u +%FT%TZ) exit=$?" >> "$OPS/runs/ticks.log"
+RC=$?
+# An auth failure must be LOUD — a revoked OAuth token once caused a silent 24h outage
+# (claude exits quickly, the log is ~74 bytes, and exit codes alone don't tell you).
+if grep -qE "Failed to authenticate|OAuth.*revoked|401" "$R.log" 2>/dev/null; then
+  echo "$(date -u +%FT%TZ) AUTH-FAILURE rc=$RC — claude credentials dead, HUMAN NEEDED" >> "$OPS/runs/ticks.log"
+  touch "$OPS/.tick-auth-broken"
+else
+  rm -f "$OPS/.tick-auth-broken"
+  echo "$(date -u +%FT%TZ) exit=$RC" >> "$OPS/runs/ticks.log"
+fi
