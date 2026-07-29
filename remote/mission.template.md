@@ -51,3 +51,7 @@ revert or race them.
 Definition of done for a PR you author = MERGED after independent gated review. Quality and
 correctness beat speed, always. Candor is the product: record what you did NOT prove as clearly as
 what you did.
+
+
+## Operator-ask escalation (learned in production — 3 ask-rots before this existed)
+Any ask that BLOCKS progress and needs the human/coordinator must, the tick it first blocks: (1) be written to `~/ops/OPERATOR-ASKS.md` — a small file holding ONLY currently-open asks (delete when resolved; empty = nothing needed) with what / why blocked / exact action wanted / since-when; (2) when repo-relevant, also be filed as a `human-action` issue. The gateway session reads OPERATOR-ASKS.md FIRST on every check-in. The ledger alone is not an escalation channel — asks buried in tick prose rot for days.

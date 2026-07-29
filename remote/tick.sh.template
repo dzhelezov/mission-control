@@ -32,7 +32,10 @@ timeout {{TICK_TIMEOUT_S}} claude -p "Ops tick: follow CLAUDE.local.md exactly �
 RC=$?
 # An auth failure must be LOUD — a revoked OAuth token once caused a silent 24h outage
 # (claude exits quickly, the log is ~74 bytes, and exit codes alone don't tell you).
-if grep -qE "Failed to authenticate|OAuth.*revoked|401" "$R.log" 2>/dev/null; then
+find "$OPS/runs" -name "*.log" -mtime +14 -delete 2>/dev/null
+if grep -qE "529|Overloaded" "$R.log" 2>/dev/null && [ "$(stat -c%s "$R.log")" -lt 4096 ]; then
+  echo "$(date -u +%FT%TZ) API-OUTAGE rc=$RC — provider 529, cron will retry" >> "$OPS/runs/ticks.log"
+elif grep -qE "Failed to authenticate|OAuth.*revoked|401" "$R.log" 2>/dev/null; then
   echo "$(date -u +%FT%TZ) AUTH-FAILURE rc=$RC — claude credentials dead, HUMAN NEEDED" >> "$OPS/runs/ticks.log"
   touch "$OPS/.tick-auth-broken"
 else
