@@ -20,18 +20,21 @@ raw artifacts from that deployment; the build generalizes them.
 | Availability | Intermittent — goes on/offline | 24/7 (cron/systemd tick loop) |
 | Driver | Human in the loop | Autonomous against standing directives |
 | Role | Observe · steer/prioritize · expert deep-dives · direct takeover (vibecoding) | Primary executor: implementation, chores, PRs driven to merge, release prep |
-| Both tiers share | The agent roster, the model policy, the peers (glm/codex), the disciplines (committee review, evidence gates) | |
+| Both tiers share | The role roster, the model policy, the harness catalog, the disciplines (committee review, evidence gates) | |
 
 The remote tier installs onto **a fresh Linux box** or as **a new tenant (dedicated user +
 systemd slice) on an existing box** — isolated home, scoped sudoers, own secrets dir, own cron.
 
-## 2. Configuration is data (three layers, one file)
+## 2. Configuration is data (four layers, one file)
 
-`config/orchestration.toml` — see `config/orchestration.example.toml` for the shipped defaults.
+`orchestration.toml` — see `orchestration.example.toml` for the shipped defaults.
 
-1. **Model catalog** — the taste/cost/intelligence matrix as editable data. Each model: pool
-   (claude-max / codex-sub / openrouter / api), cost, intel, taste scores. When the market moves
-   (new model, price change), edit the row.
+0. **Harness catalog** — how a model is actually reached: the CLI, its auth file, its one-shot
+   invocation template, and which providers it can serve. `bin/agent` composes argv from this row,
+   so swapping a harness moves every role that uses it without touching a role definition.
+1. **Pool + model catalog** — pools carry the *billing surface* (subscription vs metered); models
+   carry the taste/cost/intelligence matrix and point at a pool. When the market moves (new model,
+   price change, a provider you'd rather route around), edit the row.
 2. **Role schema** — roles are declared, not hardcoded, and seats can be N-wide:
    judgment roles (cto, deep-reasoner), dispatch (orchestrator), implement (a *pair*: brain +
    hands), review (a *committee* with per-seat lenses + an arbiter), mechanical. Escalation
@@ -42,12 +45,48 @@ systemd slice) on an existing box** — isolated home, scoped sudoers, own secre
    multi-track for high-stakes. Documented in `docs/routing.md` so a future maintainer can
    re-tune defaults by the same reasoning that produced them.
 
-**Shipped defaults** (proven cost/value: Claude Max + Codex sub + OpenRouter credits):
+**Shipped defaults** (proven cost/value: Claude Max + ChatGPT sub + OpenRouter credits):
 fable = CTO/deep-reasoner (judgment); opus = orchestrator + escalation coder + committee-judgment
-seat; **implementation default = glm-5.2 (brain) + gpt-5.5/codex (hands)** — the free-pool pair;
-**review = 3-seat committee** — glm (taste) ∥ codex (adversarial-empirical) ∥ opus (judgment, on
-substantive PRs) with fable as arbiter on splits; mechanical → codex (sonnet available, near-
-dominated). The codex model is a knob (`gpt-5.5` default; e.g. `sol` selectable).
+seat; **implementation default = kimi-k3 (brain) + deepseek-v4-flash (hands)** — a frontier drafter
+over a near-free executor; **review = 4-seat committee** — kimi (taste + whole-repo) ∥ sol
+(adversarial-empirical) ∥ qwen3.8-max (independent lineage) ∥ opus (judgment, on substantive PRs)
+with fable as arbiter on splits; mechanical + compression → deepseek-v4-flash; long-context sweeps
+→ kimi-k3. glm-5.2 was the metered brain until 2026-08 and is now retired in favour of kimi-k3.
+
+## 2b. Why two harnesses (the finding that shaped this kit)
+
+prime-agent is the better executor: one model-facing tool (a persistent IPython kernel), ~20
+providers behind one config, daemon-backed resident sessions, persistent goals, native cron
+schedules, heartbeats, autonomous quality gates, recursive `rlm()` subagents, and a continual
+harness that stores the roster as refinable specs. The obvious move is to run everything on it.
+
+The obvious move is wrong for one pool. prime-agent's own source says Anthropic subscription auth
+"draws from extra usage and is billed per token, not your Claude plan limits"
+(`packages/coding-agent/src/modes/interactive/auth-flows.ts`), and it ships a
+`warnings.anthropicExtraUsage` setting to nag about exactly that. A wholesale swap would silently
+convert a flat Max plan into a metered API bill. The ChatGPT side has no such caveat: the
+`openai-codex` provider posts to `chatgpt.com/backend-api` under OpenAI's "Codex for OSS" path, so
+prime-agent rides that subscription for real.
+
+Hence: harness is a config row, and exactly one guardrail is non-negotiable — Anthropic models run
+on the `claude` harness. `bin/agent` refuses otherwise unless `--allow-metered` is passed. This is
+the difference between "provider-agnostic" and "vendor-blind": the kit knows what each route costs.
+
+Second-order consequence worth stating: scarcity is now two-dimensional. Subscription pools are
+capped by *rate* (weekly caps that do get hit); metered pools are capped by *dollars*. Pushing
+volume onto a $0.09/M seat is not primarily about saving money — it is about keeping the
+subscription caps available for judgment work.
+
+## 2c. Native over hand-rolled
+
+Everything the old tick loop emulated by hand, prime-agent owns natively, so the resident tier uses
+the native mechanism and cron degrades to a supervisor that notices death: persistent **goal** for
+the standing mission · native **schedule** for the tick (claims before delivery, coalesces missed
+ticks) · **heartbeats** for watch loops · **autonomous gates** for "not done until it builds" ·
+**harness subagent specs** + `rlm()` for the roster · `prime-agent send` for laptop steering without
+ssh · `refine.run()` to turn repeated failures into durable harness state. `prime/bootstrap.py`
+compiles `orchestration.toml` + `agents/*.md` into that harness state, resolving every model id to a
+live `rlm.find_models` selector so an unreachable model fails at bootstrap, not mid-mission.
 
 ## 3. Sync: GitHub-native (no bespoke ledger)
 
@@ -71,18 +110,21 @@ Each deployment instance is a **private clone of this repo = the control repo**.
 `CLAUDE.md` routes a fresh Claude Code session into `skills/setup` — an interview:
 
 1. Which tier(s) to set up here?
-2. **Laptop**: install `agents/` → `~/.claude/agents/`, `peers/glm` → PATH, verify codex CLI +
-   auth, verify `gh` auth, write the laptop-side config, bootstrap memory pointers.
-3. **Remote**: ask for ssh target + tenant name → provision user/slice + toolchain (node, claude,
-   codex, gh, glm) → auth dance, asking only for what's missing: Claude credentials (Max
-   subscription, headless pattern), codex auth, `gh` fine-grained PAT (scoping guidance baked in:
-   Contents/PRs/Issues write, Actions read, **no workflow scope**), OpenRouter key → write
-   `~/ops/secrets/*.env` (600) → seed the mission doc from `remote/mission.template.md`
-   (parameterized: project, goals, guardrails, human-reserved list) → install tick
-   (cron/systemd) → run a **smoke tick** end-to-end.
-4. `skills/doctor` — idempotent verification, re-runnable anytime: model probes per pool, glm/codex
-   round-trips, gh capability probes (push/PR/issue on the intended repos), tick lock/idle-gate
-   sanity, secrets permissions, directive round-trip (open a test issue → see the tick consume it).
+2. **Laptop**: install `agents/` → `~/.claude/agents/` and `bin/agent` → PATH; install prime-agent
+   and log it in to the **ChatGPT** subscription (explicitly *not* Claude — explain the billing);
+   render `prime/settings.json` + `prime/models.json`; verify codex and `gh` auth.
+3. **Remote**: ask for ssh target + tenant name + which harness drives the loop → provision
+   user/slice + toolchain (node, python3, tmux, gh, and the named harnesses) → auth dance, asking
+   only for what's missing: Claude credentials (Max, headless pattern), prime-agent `auth.json`
+   (log in on the laptop, copy at 600), codex auth, `gh` fine-grained PAT (scoping guidance baked
+   in: Contents/PRs/Issues write, Actions read, **no workflow scope**), OpenRouter key → write
+   `~/ops/secrets/*.env` (600) → seed the mission doc from `remote/mission.template.md` → install
+   the resident supervisor (prime) or the cron tick (claude) → `prime/bootstrap.py` to compile the
+   roster into the continual harness → run a **smoke run** end-to-end.
+4. `skills/doctor` — idempotent verification, re-runnable anytime: per-harness round-trips, model
+   probes per pool, `qwen3.8-max` present in `prime-agent model list`, resident alive + native
+   schedule registered + goal state sane, gh capability probes (push/PR/issue on the intended
+   repos), secrets permissions, directive round-trip (open a test issue → see it consumed).
 
 ## 5. Guardrail catalog (shipped, parameterized per deployment)
 
@@ -100,7 +142,12 @@ Each deployment instance is a **private clone of this repo = the control repo**.
 - **P0 — scaffold** (done, laptop): this design, example config, seeded `extracted/`.
 - **P1 — extract & generalize**: `extracted/*` → real kit locations; parameterize tick.sh
   (paths/models/cadence from config; directive-aware idle-gate), generalize the mission template
-  (portal-ponder specifics out, template variables in), agents unchanged, glm CLI config-driven.
+  (portal-ponder specifics out, template variables in), agents unchanged, peer CLI config-driven.
+- **P1b — harness-agnostic** (this branch): harness/pool catalogs; `bin/agent` replaces `bin/glm`
+  and enforces the Anthropic billing rule; prime-agent as the default executor with a resident
+  supervisor, native goal/schedule/gates, and `prime/bootstrap.py` compiling the roster into the
+  continual harness; roster prompts de-hardcoded to roles. Acceptance: `agent --list` green on a
+  fresh box, and a resident session consuming a directive with the laptop offline.
 - **P2 — setup + doctor skills**: the interview + verification, per §4. Acceptance: a fresh
   container/VM reaches a green doctor from nothing but the repo + credentials.
 - **P3 — GitHub-native sync**: directive/journal conventions, labels, issue templates, the
@@ -117,4 +164,5 @@ P0 and judges P4. Every phase lands as a PR with the standard evidence gates.
 ## 7. Non-goals (v1)
 
 Multi-box fleets; non-GitHub forges; Windows laptops; secrets managers beyond env-files (pluggable
-later); UI dashboards (the journal issue + `gh` are the dashboard).
+later); UI dashboards (the journal issue + `gh` are the dashboard); local/self-hosted inference
+(prime-agent supports it via `models.json`, but nothing here is tuned for it).

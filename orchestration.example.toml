@@ -1,6 +1,10 @@
 # mission-control — orchestration config (shipped defaults; copy to orchestration.toml and edit)
-# Three layers: model catalog (data) → role schema (declared roles/seats) → routing (principles
-# live in docs/routing.md; re-derive assignments from the catalog by those principles).
+# Four layers, all data:
+#   0) HARNESS catalog  — how a model is actually reached, and who pays for it
+#   1) POOL catalog     — billing surfaces (subscription vs metered)
+#   2) MODEL catalog    — the taste/cost/intelligence matrix
+#   3) ROLE schema      — declared roles, N-wide seats, explicit escalation
+# Routing principles live in CLAUDE.md; re-derive assignments from the catalog by those principles.
 
 [deployment]
 control_repo = "you/your-mission-control-instance"   # private clone of this kit = the control repo
@@ -8,45 +12,149 @@ target_repos = ["you/your-project"]                  # where work products (PRs)
 tick_minutes = 45                                    # remote cadence (cron */45-style)
 journal_issue = "journal"                            # pinned issue label for tick reports
 directive_label = "directive"                        # issues the remote consumes as work
+tick_harness = "claude"                              # which harness drives the resident tick loop
 
-# ── 1) MODEL CATALOG ─ the taste/cost/intelligence matrix, as data ──────────────────────────────
-# cost: higher = cheaper/flatter. intel: unsupervised problem-hardness. taste: code/design/API quality.
+# ── 0) HARNESS CATALOG ─ a harness is an agent runtime, not a model ─────────────────────────────
+# `bin/agent` resolves model -> pool -> harness and builds the argv. Swap a harness row and every
+# role that uses it moves; no role definition changes.
+
+[harnesses.claude]
+cmd          = "claude"
+kind         = "agentic"                 # full tool loop, edits files, runs commands
+auth_file    = "~/.claude/.credentials.json"
+oneshot      = "claude -p {PROMPT} --model {ID} --effort {EFFORT}"
+system_flag  = "--append-system-prompt"
+yolo_flag    = "--dangerously-skip-permissions"
+providers    = ["anthropic"]
+# The ONLY harness that spends Claude Pro/Max plan limits instead of per-token dollars.
+
+[harnesses.prime]
+cmd          = "prime-agent"             # https://github.com/PrimeIntellect-ai/prime-agent
+kind         = "agentic"                 # one model-facing tool: a persistent IPython kernel
+install      = "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"
+auth_file    = "~/.prime/agent/auth.json"
+config_dir   = "~/.prime/agent"          # settings.json · models.json · AGENTS.md · agents/ · sessions/
+oneshot      = "prime-agent -p --provider {PROVIDER} --model {ID} --thinking {EFFORT}"
+system_flag  = "--append-system-prompt"
+providers    = ["openai-codex", "openrouter", "anthropic", "prime-inference", "zai", "moonshotai",
+                "google", "xai", "deepseek", "groq", "cerebras", "fireworks", "amazon-bedrock",
+                "azure-openai-responses", "google-vertex", "vercel-ai-gateway", "github-copilot"]
+# Reads CLAUDE.md/AGENTS.md as context files, so the mission doc works unchanged.
+# Autonomous mode (--autonomous --autonomous-gate CMD) replaces hand-rolled retry loops.
+
+[harnesses.codex]
+cmd          = "codex"
+kind         = "agentic"
+auth_file    = "~/.codex/auth.json"
+oneshot      = "codex exec -m {ID} -c model_reasoning_effort={EFFORT} {PROMPT}"
+providers    = ["openai-codex"]
+# Kept as the proven alternate seat for the ChatGPT subscription; same billing as prime+openai-codex.
+
+[harnesses.http]
+cmd          = ""                        # built into bin/agent (stdlib urllib, zero deps)
+kind         = "oneshot"                 # prompt in, answer out — no tools, no file access
+providers    = ["openrouter"]
+# The portable fallback: works on any box before prime-agent is installed. Peer/committee duty only.
+
+# ── 1) POOL CATALOG ─ what each surface actually costs ──────────────────────────────────────────
+
+[pools.claude-max]
+billing  = "subscription"      # Claude Pro/Max plan limits; $0 marginal
+harness  = "claude"
+provider = "anthropic"
+
+[pools.chatgpt-sub]
+billing      = "subscription"  # ChatGPT Plus/Pro; $0 marginal (OpenAI "Codex for OSS")
+harness      = "prime"
+provider     = "openai-codex"
+alt_harness  = "codex"         # `codex exec` — same subscription, older/proven path
+
+[pools.openrouter]
+billing          = "metered"   # real dollars per token; keep under [guardrails].metered_budget_usd
+harness          = "prime"
+provider         = "openrouter"
+fallback_harness = "http"      # bin/agent's built-in client when prime-agent isn't installed
+
+[pools.anthropic-api]
+billing  = "metered"           # DO NOT route Claude models here by accident — see the guardrail below
+harness  = "prime"
+provider = "anthropic"
+# prime-agent's Anthropic OAuth draws from claude.ai *extra usage*, billed per token, NOT plan limits
+# (auth-flows.ts: ANTHROPIC_SUBSCRIPTION_AUTH_WARNING). Anthropic work belongs on harness=claude.
+
+# ── 2) MODEL CATALOG ─ the taste/cost/intelligence matrix, as data ──────────────────────────────
+# cost: higher = cheaper/flatter (subscription = 9). intel: unsupervised problem-hardness.
+# taste: code/design/API quality. Prices are USD per 1M tokens, verified 2026-08-06.
+
 [models.fable]
-id = "claude-fable-5"
-pool = "claude-max"        # subscription on Max; $-metered on API — the scarce judgment resource
+id      = "claude-fable-5"
+pool    = "claude-max"
+alt_id  = "anthropic/claude-fable-5"   # same weights via [pools.openrouter], metered ($10/$50)
 cost = 2
 intel = 9
 taste = 9
+efforts = ["low", "medium", "high", "xhigh", "max"]
 
 [models.opus]
-id = "claude-opus-4-8"
-pool = "claude-max"
+id      = "claude-opus-5"
+pool    = "claude-max"
+alt_id  = "anthropic/claude-opus-5"    # metered ($5/$25)
 cost = 4
-intel = 7
-taste = 8
+intel = 8
+taste = 9
+efforts = ["low", "medium", "high", "xhigh", "max"]
 
 [models.sonnet]
-id = "claude-sonnet-5"
+id   = "claude-sonnet-5"
 pool = "claude-max"
 cost = 5
-intel = 5
+intel = 6
 taste = 7
+efforts = ["low", "medium", "high", "xhigh"]
 
-[models.codex]
-id = "gpt-5.6-sol"         # verified live 2026-07-10 (needs codex CLI >= 0.144); prior default: "gpt-5.5"
-pool = "codex-sub"         # flat plan → $0 marginal; reached via `codex exec`
+[models.sol]
+id      = "gpt-5.6-sol"                # ChatGPT sub via prime-agent openai-codex, or `codex exec`
+pool    = "chatgpt-sub"
+alt_id  = "openai/gpt-5.6-sol"         # metered ($5/$30) via openrouter
 cost = 9
 intel = 8
-taste = 5
+taste = 6
+efforts = ["low", "medium", "high", "xhigh", "max"]
 
-[models.glm]
-id = "z-ai/glm-5.2"        # via OpenRouter; reached via the `glm` CLI (peers/glm)
+[models.qwen]
+id   = "qwen/qwen3.8-max"              # 1M ctx · $2/$6 · text+image+video in
+pool = "openrouter"
+cost = 7
+intel = 7
+taste = 7
+efforts = ["low", "medium", "high", "xhigh"]
+# NOT in prime-agent's built-in catalog as of 0.73 — prime/models.json.template adds it.
+
+[models.flash]
+id   = "deepseek/deepseek-v4-flash-0731"  # 1,048,576 ctx · $0.09/$0.18 · near-frontier for pennies
 pool = "openrouter"
 cost = 9
 intel = 7
-taste = 8
+taste = 7
+efforts = ["high", "xhigh", "max"]     # built-in map nulls minimal/low/medium; xhigh -> provider `max`
+# The volume seat: hands, bulk, and context compression. A day of file-editing costs cents, which
+# is the point — it keeps volume off the subscription pools' weekly caps.
+# Direct DeepSeek (prime provider `deepseek`, id `deepseek-v4-flash`) is an alternative route;
+# OpenRouter is the default so one key covers every metered model. maxTokens is 65536 on this
+# dated snapshot vs 393216 on `deepseek/deepseek-v4-flash` — matters for long single outputs.
 
-# ── 2) ROLE SCHEMA ─ roles are declared, seats can be N-wide, escalation is explicit ────────────
+[models.kimi]
+id   = "moonshotai/kimi-k3"            # 1,048,576 ctx · $3/$15 · frontier-class non-US lineage
+pool = "openrouter"
+cost = 6
+intel = 8
+taste = 8
+efforts = ["max"]                      # built-in thinkingLevelMap nulls every level except `max`
+# Replaces glm-5.2 as the metered brain/taste seat (2026-08). Frontier class, 4x the price, and
+# every call reasons at `max` — watch [guardrails].metered_budget_usd. Reinstate a cheap drafter
+# by adding a row here (e.g. z-ai/glm-5.2, $0.76/$2.42) and giving it the bulk seats.
+
+# ── 3) ROLE SCHEMA ─ roles are declared, seats can be N-wide, escalation is explicit ────────────
 [roles.cto]                 # architecture, roadmap, specs, arbitration, taste-setting — periodic
 kind = "judgment"
 seats = [{ model = "fable", effort = "xhigh" }]
@@ -59,43 +167,59 @@ seats = [{ model = "fable", effort = "max" }]
 kind = "dispatch"
 seats = [{ model = "opus", effort = "xhigh" }]
 
-[roles.code]                # DEFAULT implementation = free-pool brain+hands pair
+[roles.code]                # DEFAULT implementation = frontier brain + near-free hands
 kind = "implement"
 seats = [
-  { model = "glm",   as = "brain" },   # drafts tasteful code/API/tests (text-only)
-  { model = "codex", as = "hands" },   # applies files, runs tests, iterates (one retry, then back to brain)
+  { model = "kimi",  as = "brain" },  # drafts tasteful code/API/tests over whole-repo context
+  { model = "flash", as = "hands" },  # applies files, runs tests, iterates (one retry, then brain)
 ]
+alt_hands = "sol"           # when you'd rather spend the ChatGPT sub than dollars, or need
+                            # cross-family execution for a verification pass
 [roles.code.escalation]
 model = "opus"
 effort = "xhigh"
 when = "taste-critical | correctness-critical | pair-stalls"
 
-[roles.review]              # per-PR committee, blind seats, per-seat lenses
+[roles.review]              # per-PR committee, blind seats, per-seat lenses, distinct lineages
 kind = "committee"
 seats = [
-  { model = "glm",   lens = "taste" },
-  { model = "codex", lens = "adversarial-empirical" },
-  { model = "opus",  lens = "judgment", when = "substantive" },
+  { model = "kimi", lens = "taste + whole-repo context" },
+  { model = "sol",  lens = "adversarial-empirical" },
+  { model = "qwen", lens = "independent-lineage", when = "substantive" },
+  { model = "opus", lens = "judgment", when = "substantive" },
 ]
 [roles.review.arbiter]
 model = "fable"
 when = "split | invariant-critical"
 
+[roles.long-context]        # whole-repo sweeps, cross-file invariants, migration audits
+kind = "survey"
+seats = [{ model = "kimi", effort = "max" }]
+
 [roles.mechanical]          # bulk/boilerplate/formatting/running suites
 kind = "execute"
-seats = [{ model = "codex" }]          # free pool default
-# alternative in-harness seat (near-dominated; enable if you prefer Claude-native mechanical):
-# seats = [{ model = "sonnet", effort = "low" }]
+seats = [{ model = "flash", effort = "high" }]
+# alternatives: { model = "sol" } to spend subscription instead of dollars;
+#               { model = "sonnet", effort = "low" } for in-harness Claude-native mechanical work
 
-# ── 3) GUARDRAILS (parameterized per deployment; rendered into the remote mission doc) ──────────
+[roles.compress]            # distillation: raw logs/diffs/ledgers -> a briefing packet for judgment
+kind = "execute"
+seats = [{ model = "flash", effort = "high" }]
+# 1M context at $0.09/M is what makes "never send raw dumps to the CTO" affordable.
+
+# ── 4) GUARDRAILS (parameterized per deployment; rendered into the remote mission doc) ──────────
 [guardrails]
 human_reserved = [
   "publish to package registries (until gated release-automation is proven)",
   "external outreach",
   "merges to production docs/sites",
-  "spend beyond budget_usd",
+  "spend beyond metered_budget_usd",
 ]
-budget_usd = 50
+metered_budget_usd = 50       # applies to [pools.*] with billing = "metered" only
+anthropic_subscription_only = true   # HARD RULE: Anthropic models run on harness=claude.
+                                     # bin/agent refuses to route them through a metered pool
+                                     # unless you pass --allow-metered. Flipping this to false
+                                     # converts your Max plan into a per-token bill.
 public_surface_rule = true    # never post infra internals to public repos
 secret_scan = true            # pre-commit/pre-push scans; keys env-file-only (600), never argv
 workflow_scope = "human"      # workflow-file pushes stay human (PAT has no workflow scope)

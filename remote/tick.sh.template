@@ -1,9 +1,25 @@
 #!/usr/bin/env bash
 # mission-control remote tick — rendered from tick.sh.template at setup ({{VARS}} filled by Claude).
 # Cron-driven autonomous heartbeat: zero-token idle-gate, directive-aware, journaling via gh.
+# Harness-agnostic: {{TICK_HARNESS}} is `claude` (Claude Max plan limits) or `prime` (prime-agent,
+# billed per the provider it is pointed at). The model catalog lives in orchestration.toml.
+#
+# For the prime harness this stateless tick is the FALLBACK, not the default: prefer
+# remote/resident.sh.template, which runs a daemon-backed resident session with a persistent goal,
+# a native schedule, heartbeats, and autonomous gates. Use this file when you deliberately want a
+# cold, stateless, cron-owned invocation (no daemon, no session state between runs).
 exec 9>{{OPS_DIR}}/.lock; flock -n 9 || exit 0
-[ -f ~/.claude/.credentials.json ] || { echo "$(date -u +%FT%TZ) no-auth" >> {{OPS_DIR}}/runs/skipped.log; exit 0; }
 OPS={{OPS_DIR}}
+HARNESS={{TICK_HARNESS}}
+
+# ---- auth precheck: a dead credential must never look like an idle box ----------------------
+case "$HARNESS" in
+  claude) AUTH_FILE=~/.claude/.credentials.json ;;
+  prime)  AUTH_FILE=~/.prime/agent/auth.json ;;
+  *)      echo "$(date -u +%FT%TZ) BAD-HARNESS=$HARNESS" >> "$OPS/runs/ticks.log"; exit 1 ;;
+esac
+[ -f "$AUTH_FILE" ] || { echo "$(date -u +%FT%TZ) no-auth $HARNESS" >> $OPS/runs/skipped.log; exit 0; }
+
 R=$OPS/runs/$(date -u +%Y%m%dT%H%M)
 cd {{PROJECT_DIR}} && git fetch -q origin && git checkout -q main && git pull -q
 
@@ -27,18 +43,36 @@ fi
 echo "$FP" > "$OPS/.tick-fp"; echo "$NOW" > "$OPS/.tick-lastrun"
 # --------------------------------------------------------------------------------------------
 
-timeout {{TICK_TIMEOUT_S}} claude -p "Ops tick: follow CLAUDE.local.md exactly — ops sweep first, then consume open '{{DIRECTIVE_LABEL}}' issues on {{CONTROL_REPO}} (priority:high first), then continue the standing mission. Journal a per-tick report as a comment on the '{{CONTROL_REPO}}' issue titled 'journal'. Be surgical; leave durable state (PRs, issue comments) for the next tick." \
-  --model {{MODEL_ID}} --effort {{EFFORT}} --dangerously-skip-permissions > "$R.log" 2>&1
+PROMPT="Ops tick: follow {{MISSION_DOC}} exactly — ops sweep first, then consume open '{{DIRECTIVE_LABEL}}' issues on {{CONTROL_REPO}} (priority:high first), then continue the standing mission. Journal a per-tick report as a comment on the '{{CONTROL_REPO}}' issue titled 'journal'. Be surgical; leave durable state (PRs, issue comments) for the next tick."
+
+case "$HARNESS" in
+claude)
+  timeout {{TICK_TIMEOUT_S}} claude -p "$PROMPT" \
+    --model {{MODEL_ID}} --effort {{EFFORT}} --dangerously-skip-permissions > "$R.log" 2>&1
+  ;;
+prime)
+  # --offline skips startup update checks only (provider calls still go out) — cron wants that.
+  # Autonomous mode replaces hand-rolled retries: the run may not finish until the gate passes.
+  PI_SKIP_VERSION_CHECK=1 timeout {{TICK_TIMEOUT_S}} prime-agent -p "$PROMPT" \
+    --provider {{PROVIDER}} --model {{MODEL_ID}} --thinking {{EFFORT}} \
+    --offline --cwd {{PROJECT_DIR}} \
+    --autonomous --autonomous-gate "{{TICK_GATE}}" \
+    --autonomous-max-turns {{TICK_MAX_TURNS}} --autonomous-timeout-ms {{TICK_TIMEOUT_MS}} \
+    > "$R.log" 2>&1
+  ;;
+esac
 RC=$?
+
 # An auth failure must be LOUD — a revoked OAuth token once caused a silent 24h outage
-# (claude exits quickly, the log is ~74 bytes, and exit codes alone don't tell you).
+# (the harness exits quickly, the log is ~74 bytes, and exit codes alone don't tell you).
 find "$OPS/runs" -name "*.log" -mtime +14 -delete 2>/dev/null
-if grep -qE "529|Overloaded" "$R.log" 2>/dev/null && [ "$(stat -c%s "$R.log")" -lt 4096 ]; then
-  echo "$(date -u +%FT%TZ) API-OUTAGE rc=$RC — provider 529, cron will retry" >> "$OPS/runs/ticks.log"
-elif grep -qE "Failed to authenticate|OAuth.*revoked|401" "$R.log" 2>/dev/null; then
-  echo "$(date -u +%FT%TZ) AUTH-FAILURE rc=$RC — claude credentials dead, HUMAN NEEDED" >> "$OPS/runs/ticks.log"
+find ~/.prime/agent/sessions -name "*.jsonl" -mtime +30 -delete 2>/dev/null
+if grep -qE "529|Overloaded|rate.?limit" "$R.log" 2>/dev/null && [ "$(stat -c%s "$R.log")" -lt 4096 ]; then
+  echo "$(date -u +%FT%TZ) API-OUTAGE rc=$RC — provider throttled, cron will retry" >> "$OPS/runs/ticks.log"
+elif grep -qE "Failed to authenticate|OAuth.*revoked|401|Unauthorized|/login" "$R.log" 2>/dev/null; then
+  echo "$(date -u +%FT%TZ) AUTH-FAILURE rc=$RC — $HARNESS credentials dead, HUMAN NEEDED" >> "$OPS/runs/ticks.log"
   touch "$OPS/.tick-auth-broken"
 else
   rm -f "$OPS/.tick-auth-broken"
-  echo "$(date -u +%FT%TZ) exit=$RC" >> "$OPS/runs/ticks.log"
+  echo "$(date -u +%FT%TZ) exit=$RC harness=$HARNESS" >> "$OPS/runs/ticks.log"
 fi

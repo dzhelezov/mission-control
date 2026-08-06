@@ -1,0 +1,38 @@
+{
+  "_comment": [
+    "mission-control -> ~/.prime/agent/models.json  (rendered at setup; no {{VARS}} needed).",
+    "Prime Agent ships a built-in catalog per release. This file only adds what that catalog",
+    "is missing and pins routing. Merge semantics: built-in models are kept, custom models are",
+    "upserted by id, a matching id replaces the built-in entry.",
+    "Re-check on every prime-agent update: if qwen3.8-max lands in the built-in catalog, delete",
+    "its block here so the shipped pricing/limits win."
+  ],
+  "providers": {
+    "openrouter": {
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "openai-completions",
+      "apiKey": "OPENROUTER_API_KEY",
+      "models": [
+        {
+          "id": "qwen/qwen3.8-max",
+          "name": "Qwen3.8 Max",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "contextWindow": 1000000,
+          "maxTokens": 131072,
+          "cost": { "input": 2, "output": 6, "cacheRead": 0.25, "cacheWrite": 2.5 },
+          "compat": {
+            "openRouterRouting": { "data_collection": "deny", "allow_fallbacks": true }
+          }
+        }
+      ],
+      "modelOverrides": {
+        "moonshotai/kimi-k3": {
+          "compat": {
+            "openRouterRouting": { "data_collection": "deny", "allow_fallbacks": true }
+          }
+        }
+      }
+    }
+  }
+}
