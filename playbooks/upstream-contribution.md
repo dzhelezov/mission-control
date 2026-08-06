@@ -197,7 +197,20 @@ prime-agent --cwd ~/work/REPO \
 
 The second gate is the interference guard expressed as a command: the run cannot finish while a
 workflow file is staged. Add one gate per rule you actually care about — a gate is worth more than
-a paragraph of instruction, because the harness enforces it.
+a paragraph of instruction, because the harness enforces it. Gate the *deliverable* too
+(`--autonomous-gate "test -s findings.md"`): analysis that never gets written down is analysis you
+paid for twice.
+
+**Resuming.** A long analysis will outlive whatever timeout wraps it. Resume by **path**, not id —
+the session *filename* is not the session id (`~/.prime/agent/sessions/<A>.jsonl` contains
+`"id": "<B>"`), and `--resume <id>` will not find it:
+
+```bash
+prime-agent -p --resume "$(ls -t ~/.prime/agent/sessions/*.jsonl | head -1)" \
+  --autonomous --autonomous-gate "test -s findings.md" "Write findings.md now."
+```
+
+Resuming keeps the whole investigation in context, so the second run pays for the write-up only.
 
 **Resident, contributing continuously:** run `remote/resident.sh` with the goal above, then let the
 native schedule re-orient every tick. Steer without ssh:
