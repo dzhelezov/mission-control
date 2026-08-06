@@ -4,7 +4,9 @@
     "Project settings override global; nested objects merge.",
     "defaultProvider/defaultModel set the interactive default only — the tick loop and bin/agent",
     "always pass --provider/--model explicitly, so the catalog in orchestration.toml stays the",
-    "single source of truth."
+    "single source of truth. But point the default at a provider you are ACTUALLY logged into:",
+    "subcommands (schedule, send, list) resolve the default model first and refuse to run when",
+    "it has no credentials. Shipped default assumes the ChatGPT login; switch it if you skip that."
   ],
 
   "defaultProvider": "openai-codex",
