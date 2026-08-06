@@ -51,9 +51,10 @@ provider (`chatgpt.com/backend-api`, OpenAI's "Codex for OSS" path) at no margin
    Do **not** log in with Claude Pro/Max here unless the human explicitly wants metered extra
    usage; explain the billing first.
 4. Render `prime/settings.json.template` → `~/.prime/agent/settings.json` and
-   `prime/models.json.template` → `~/.prime/agent/models.json`. The models file exists because
-   prime-agent's built-in catalog does not yet carry `qwen/qwen3.8-max`; delete that block once a
-   release ships it (`prime-agent model list qwen`).
+   `prime/models.json.template` → `~/.prime/agent/models.json`. Every model in the catalog ships in
+   prime-agent's own model list (verified on 0.7.0), so the models file adds nothing — it only pins
+   OpenRouter routing (`data_collection: deny`, fallbacks on). Confirm with
+   `prime-agent model list <id>`, which needs that provider's credentials before it lists anything.
 5. Verify codex: `codex exec -m <models.sol.id> ... "reply OK"`. Verify `gh auth status`.
 6. Smoke: `agent --list` (every row should show its harness and billing, no `[!!]` markers), then
    `agent --model flash --effort high "reply OK"`.
@@ -112,6 +113,16 @@ When the harness is prime-agent, do not re-implement what it already owns:
 
 `bin/agent` stays the right tool for one-shot, cross-harness calls — peers, committee seats, and
 every Anthropic seat — because it is the thing that knows the billing rule.
+
+## Contributing to repos you do not own
+
+`playbooks/upstream-contribution.md` is the discipline for pointing this at a live project with
+active maintainers: observer/contributor/committer modes, orient-before-acting, the four-part
+verification bar a finding must clear before it costs anyone attention, small single-purpose PRs,
+and the collaboration rules (claim before coding, rebase onto them never over them, cap open PRs,
+complement rather than compete). `[upstream]` in `orchestration.toml` carries the knobs. Prefer
+expressing a rule as an `--autonomous-gate` command over stating it in prose — the harness enforces
+a gate; it only reads a paragraph.
 
 ## Doctor (run anytime; idempotent)
 

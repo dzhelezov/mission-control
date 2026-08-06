@@ -128,7 +128,8 @@ cost = 7
 intel = 7
 taste = 7
 efforts = ["low", "medium", "high", "xhigh"]
-# NOT in prime-agent's built-in catalog as of 0.73 — prime/models.json.template adds it.
+# Present in prime-agent 0.7.0's built-in catalog (verified `prime-agent model list qwen3.8`);
+# prime/models.json.template only pins its routing.
 
 [models.flash]
 id   = "deepseek/deepseek-v4-flash-0731"  # 1,048,576 ctx · $0.09/$0.18 · near-frontier for pennies
@@ -223,3 +224,9 @@ anthropic_subscription_only = true   # HARD RULE: Anthropic models run on harnes
 public_surface_rule = true    # never post infra internals to public repos
 secret_scan = true            # pre-commit/pre-push scans; keys env-file-only (600), never argv
 workflow_scope = "human"      # workflow-file pushes stay human (PAT has no workflow scope)
+
+[upstream]                    # etiquette on repos we do NOT own — see playbooks/upstream-contribution.md
+mode = "contributor"          # observer (read-only) | contributor (fork + PRs) | committer (human-granted)
+max_open_prs = 2              # per upstream repo; no new PR until an earlier one gets a response
+claim_before_coding = true    # comment on the issue and wait a day before starting
+never_touch = [".github/workflows/", "release configs", "CI credentials"]
