@@ -46,12 +46,22 @@ heartbeat() { # heartbeat <phase> <rc> <mode>
 # (the starvation fix). gh failures inject randomness -> fingerprint differs -> RUN (fail open).
 # Every path in here must be a LIVE read: a fingerprint input that points at a retired file freezes
 # silently and the gate stops sensing that dimension at all (continuity.md §8).
+# THE HEARTBEAT ISSUE MUST NEVER CONTRIBUTE TO THE FINGERPRINT. The tick edits that issue on every
+# single run, so including its `updatedAt` makes the fingerprint differ every time — the gate can
+# then never match, never skips, and the zero-token idle gate silently costs a full model run every
+# cycle forever. It only bites when the control repo is also a watched repo (a single-repo project),
+# which is exactly the setup nobody tests. Found in an e2e run; filtered by number on both queries.
+HB={{HEARTBEAT_ISSUE}}
 FP=$( {
   git ls-remote -q origin 2>/dev/null | sort
   gh pr list --state open --json number,updatedAt 2>/dev/null || echo "GH_PR_FAIL_$RANDOM"
-  gh issue list --state open --json number,updatedAt 2>/dev/null || echo "GH_ISSUE_FAIL_$RANDOM"
+  gh issue list --state open --json number,updatedAt \
+      -q ".[] | select(.number != $HB) | \"\(.number) \(.updatedAt)\"" 2>/dev/null \
+      || echo "GH_ISSUE_FAIL_$RANDOM"
   gh issue list -R {{CONTROL_REPO}} --state open --label "{{DIRECTIVE_LABEL}}" \
-      --json number,updatedAt 2>/dev/null || echo "GH_DIRECTIVE_FAIL_$RANDOM"
+      --json number,updatedAt \
+      -q ".[] | select(.number != $HB) | \"\(.number) \(.updatedAt)\"" 2>/dev/null \
+      || echo "GH_DIRECTIVE_FAIL_$RANDOM"
   systemctl is-active {{UNITS}} 2>/dev/null
 } | sha256sum | cut -d' ' -f1 )
 NOW=$(date +%s); LAST=$(cat "$OPS/.tick-lastrun" 2>/dev/null || echo 0)
