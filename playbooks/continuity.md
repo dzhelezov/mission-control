@@ -208,7 +208,17 @@ count assertion certifying the wrong denominator. That is not five accidents. It
 
 **Every sensor you add needs a negative control: drive it against a known-bad state and watch it go
 red.** A sensor that has only ever been observed green is an untested branch that happens to be
-load-bearing. Two related habits:
+load-bearing.
+
+**And the controls must include the producer's real output, not only synthetic bad input.** A
+strict heartbeat parser here passed eight hand-written negative controls and then false-paged on its
+first contact with a live loop: the writer emits `rc: null` during `run_started` — correct, the run
+has no exit code yet — and the parser counted a null value as a missing field. So it cried wolf
+every time the watcher landed while a tick was in flight, which on a long tick is most of them. A
+dead-man that pages on healthy states stops being read, and then it is not a dead-man. Synthetic
+controls test the shapes you imagined; only real input tests the shapes your own producer emits.
+
+Two related habits:
 
 - **A safeguard that is built but not wired is not a safeguard.** Helpers passing their self-tests
   while the wiring stayed pending is exactly how a silent outage happens anyway.

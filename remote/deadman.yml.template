@@ -54,14 +54,19 @@ jobs:
           REC=$(printf '%s' "$BODY" | sed -n '/^```json$/,/^```$/p' | sed '1d;$d')
           [ -n "$REC" ] || fail_closed "no fenced json record in the heartbeat"
 
-          # Check for null BEFORE stringifying: `(.missing|tostring)` yields the string "null",
-          # which is truthy, so `jq -e` alone would wave an incomplete record through. (Caught by a
-          # negative control — continuity.md §8: drive every sensor against a known-bad input.)
+          # Two traps here, both found by driving this against real input rather than synthetic input:
+          #  1. Check for null BEFORE stringifying — `(.missing|tostring)` yields the string "null",
+          #     which is truthy, so `jq -e` alone waves an incomplete record through.
+          #  2. `rc` is LEGITIMATELY null in the `run_started` phase: the run has not finished, so it
+          #     has no exit code yet. Requiring it non-null pages a false alarm every time the watcher
+          #     lands while a tick is in flight — which is most of them on a long tick. That is how a
+          #     dead-man channel earns the "ignore it, it always cries wolf" reputation and stops
+          #     being a dead-man at all. Require the KEY to exist; allow the VALUE to be null.
           FIELDS=$(printf '%s' "$REC" | jq -er '
-            if (.at != null and .rc != null and .consec_fail != null and .mode != null)
+            if (.at != null and .consec_fail != null and .mode != null and has("rc"))
             then [.at, (.rc|tostring), (.consec_fail|tostring), .mode] | @tsv
             else error("missing required field") end') \
-            || fail_closed "heartbeat unparseable or missing keys (at/rc/consec_fail/mode)"
+            || fail_closed "heartbeat unparseable or missing keys (at/consec_fail/mode, rc key)"
           IFS=$'\t' read -r AT RC CONSEC MODE <<< "$FIELDS"
 
           NOW=$(date -u +%s)
