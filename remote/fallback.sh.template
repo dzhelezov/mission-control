@@ -85,7 +85,7 @@ run_leg() {
     export DISABLE_TELEMETRY=1 DISABLE_AUTOUPDATER=1 DISABLE_ERROR_REPORTING=1
     cd {{PROJECT_DIR}} || exit 90   # never inherit the caller's cwd; see continuity.md §9
     timeout {{TICK_TIMEOUT_S}} claude -p "$PROMPT" \
-      --model "$model" --effort {{FALLBACK_EFFORT}} --dangerously-skip-permissions
+      --model "$model" --effort {{FALLBACK_EFFORT}} --dangerously-skip-permissions < /dev/null
   ) > "$log" 2>&1
   local rc=$?
 

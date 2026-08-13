@@ -78,8 +78,11 @@ PROMPT="Ops tick: follow {{MISSION_DOC}} exactly. (1) Ops sweep. (2) PERCEPTION 
 
 case "$HARNESS" in
 claude)
+  # `< /dev/null` is load-bearing: without it the CLI waits on stdin, and under cron or ssh that is
+  # a 3s stall at best and an indefinite hang at worst if the caller holds the pipe open.
   timeout {{TICK_TIMEOUT_S}} claude -p "$PROMPT" \
-    --model {{MODEL_ID}} --effort {{EFFORT}} --dangerously-skip-permissions > "$R.log" 2>&1
+    --model {{MODEL_ID}} --effort {{EFFORT}} --dangerously-skip-permissions \
+    < /dev/null > "$R.log" 2>&1
   ;;
 prime)
   # --offline skips startup update checks only (provider calls still go out) — cron wants that.
@@ -89,7 +92,7 @@ prime)
     --offline --cwd {{PROJECT_DIR}} \
     --autonomous --autonomous-gate "{{TICK_GATE}}" \
     --autonomous-max-turns {{TICK_MAX_TURNS}} --autonomous-timeout-ms {{TICK_TIMEOUT_MS}} \
-    > "$R.log" 2>&1
+    < /dev/null > "$R.log" 2>&1
   ;;
 esac
 RC=$?

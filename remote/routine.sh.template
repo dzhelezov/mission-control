@@ -66,7 +66,8 @@ OUTPUT CONTRACT:
 
 cd {{PROJECT_DIR}} || { say "bad cwd"; exit 90; }
 timeout {{ROUTINE_TIMEOUT_S}} claude -p "$PROMPT" \
-  --model {{MODEL_ID}} --effort {{ROUTINE_EFFORT}} --dangerously-skip-permissions > "$LOG" 2>&1
+  --model {{MODEL_ID}} --effort {{ROUTINE_EFFORT}} --dangerously-skip-permissions \
+  < /dev/null > "$LOG" 2>&1
 RC=$?
 if [ $RC -ne 0 ] && [ -x "$OPS/fallback.sh" ]; then
   "$OPS/fallback.sh" "$RC" "$LOG" "$PROMPT" && RC=0
