@@ -1,2 +1,4 @@
 orchestration.toml
 *.env
+__pycache__/
+*.pyc

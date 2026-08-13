@@ -1,44 +1,148 @@
 #!/usr/bin/env bash
 # mission-control remote tick — rendered from tick.sh.template at setup ({{VARS}} filled by Claude).
 # Cron-driven autonomous heartbeat: zero-token idle-gate, directive-aware, journaling via gh.
+# Harness-agnostic: {{TICK_HARNESS}} is `claude` (Claude Max plan limits) or `prime` (prime-agent,
+# billed per the provider it is pointed at). The model catalog lives in orchestration.toml.
+#
+# For the prime harness this stateless tick is the FALLBACK, not the default: prefer
+# remote/resident.sh.template, which runs a daemon-backed resident session with a persistent goal,
+# a native schedule, heartbeats, and autonomous gates. Use this file when you deliberately want a
+# cold, stateless, cron-owned invocation (no daemon, no session state between runs).
 exec 9>{{OPS_DIR}}/.lock; flock -n 9 || exit 0
-[ -f ~/.claude/.credentials.json ] || { echo "$(date -u +%FT%TZ) no-auth" >> {{OPS_DIR}}/runs/skipped.log; exit 0; }
 OPS={{OPS_DIR}}
+HARNESS={{TICK_HARNESS}}
+
+# ---- auth precheck: a dead credential must never look like an idle box ----------------------
+case "$HARNESS" in
+  claude) AUTH_FILE=~/.claude/.credentials.json ;;
+  prime)  AUTH_FILE=~/.prime/agent/auth.json ;;
+  *)      echo "$(date -u +%FT%TZ) BAD-HARNESS=$HARNESS" >> "$OPS/runs/ticks.log"; exit 1 ;;
+esac
+[ -f "$AUTH_FILE" ] || { echo "$(date -u +%FT%TZ) no-auth $HARNESS" >> $OPS/runs/skipped.log; exit 0; }
+
 R=$OPS/runs/$(date -u +%Y%m%dT%H%M)
 cd {{PROJECT_DIR}} && git fetch -q origin && git checkout -q main && git pull -q
+
+# ---- heartbeat: written on EVERY path, including failure ------------------------------------
+# A record that only appears on success is a success detector, not a liveness detector.
+# The off-box watcher (remote/deadman.yml.template) strict-parses this; keep the shape stable and
+# never add fields a strict consumer would choke on. See playbooks/continuity.md §2.
+CONSEC=$(cat "$OPS/state/.consec-fail" 2>/dev/null || echo 0)
+heartbeat() { # heartbeat <phase> <rc> <mode>
+  mkdir -p "$OPS/state"
+  local rec
+  rec=$(printf '{"protocol":"HEARTBEAT","version":1,"at":"%s","phase":"%s","rc":%s,"consec_fail":%s,"mode":"%s"}' \
+        "$(date -u +%FT%TZ)" "$1" "${2:-null}" "$CONSEC" "${3:-none}")
+  printf '%s\n' "$rec" > "$OPS/state/heartbeat.json"
+  # Mirror off-box by EDITING one issue body in place (not a new comment per run — that would be
+  # thousands of comments a month). Best-effort: a gh failure must never fail the tick.
+  gh issue edit {{HEARTBEAT_ISSUE}} -R {{CONTROL_REPO}} \
+     --body "$(printf 'Machine-edited liveness record. DO NOT COMMENT.\n\n```json\n%s\n```\n' "$rec")" \
+     >/dev/null 2>&1 || echo "$(date -u +%FT%TZ) heartbeat mirror failed" >> "$OPS/runs/ticks.log"
+}
 
 # ---- zero-token idle gate: skip the LLM when nothing changed -------------------------------
 # Fingerprint includes OPEN DIRECTIVES on the control repo, so a queued directive always runs
 # (the starvation fix). gh failures inject randomness -> fingerprint differs -> RUN (fail open).
+# Every path in here must be a LIVE read: a fingerprint input that points at a retired file freezes
+# silently and the gate stops sensing that dimension at all (continuity.md §8).
+# THE HEARTBEAT ISSUE MUST NEVER CONTRIBUTE TO THE FINGERPRINT. The tick edits that issue on every
+# single run, so including its `updatedAt` makes the fingerprint differ every time — the gate can
+# then never match, never skips, and the zero-token idle gate silently costs a full model run every
+# cycle forever. It only bites when the control repo is also a watched repo (a single-repo project),
+# which is exactly the setup nobody tests. Found in an e2e run; filtered by number on both queries.
+HB={{HEARTBEAT_ISSUE}}
 FP=$( {
   git ls-remote -q origin 2>/dev/null | sort
   gh pr list --state open --json number,updatedAt 2>/dev/null || echo "GH_PR_FAIL_$RANDOM"
-  gh issue list --state open --json number,updatedAt 2>/dev/null || echo "GH_ISSUE_FAIL_$RANDOM"
+  gh issue list --state open --json number,updatedAt \
+      -q ".[] | select(.number != $HB) | \"\(.number) \(.updatedAt)\"" 2>/dev/null \
+      || echo "GH_ISSUE_FAIL_$RANDOM"
   gh issue list -R {{CONTROL_REPO}} --state open --label "{{DIRECTIVE_LABEL}}" \
-      --json number,updatedAt 2>/dev/null || echo "GH_DIRECTIVE_FAIL_$RANDOM"
+      --json number,updatedAt \
+      -q ".[] | select(.number != $HB) | \"\(.number) \(.updatedAt)\"" 2>/dev/null \
+      || echo "GH_DIRECTIVE_FAIL_$RANDOM"
   systemctl is-active {{UNITS}} 2>/dev/null
 } | sha256sum | cut -d' ' -f1 )
 NOW=$(date +%s); LAST=$(cat "$OPS/.tick-lastrun" 2>/dev/null || echo 0)
+# The idle assertion is STAGED by the model and promoted here only on a clean exit — a run that
+# crashed has not earned the right to declare the queue empty. `1 <expiry>` = genuinely idle.
+STAGED=$(cut -d' ' -f1 "$OPS/.tick-idle-ok.staged" 2>/dev/null || echo 0)
 if [ -f "$OPS/.tick-force" ]; then
   rm -f "$OPS/.tick-force"   # manual override: touch {{OPS_DIR}}/.tick-force
-elif [ "$FP" = "$(cat "$OPS/.tick-fp" 2>/dev/null)" ] && [ $((NOW - LAST)) -lt 21600 ]; then
-  echo "$(date -u +%FT%TZ) skip-idle fp=${FP:0:12}" >> "$OPS/runs/ticks.log"; exit 0
+elif [ "$FP" = "$(cat "$OPS/.tick-fp" 2>/dev/null)" ] && [ $((NOW - LAST)) -lt 21600 ] \
+     && [ "$STAGED" = "1" ]; then
+  # Re-confirm the skip against a LIVE health read. A stale "all clear" must never gate a run.
+  if {{OPS_HEALTH_CMD}} >/dev/null 2>&1; then
+    echo "$(date -u +%FT%TZ) skip-idle fp=${FP:0:12}" >> "$OPS/runs/ticks.log"
+    heartbeat skip_idle 0 none; exit 0
+  fi
+  echo "$(date -u +%FT%TZ) gate-vetoed fp=${FP:0:12} — health check failed, RUNNING" >> "$OPS/runs/ticks.log"
 fi
 echo "$FP" > "$OPS/.tick-fp"; echo "$NOW" > "$OPS/.tick-lastrun"
+rm -f "$OPS/.tick-idle-ok.staged"
+heartbeat run_started "" "{{PRIMARY_LEG_NAME}}"
 # --------------------------------------------------------------------------------------------
 
-timeout {{TICK_TIMEOUT_S}} claude -p "Ops tick: follow CLAUDE.local.md exactly — ops sweep first, then consume open '{{DIRECTIVE_LABEL}}' issues on {{CONTROL_REPO}} (priority:high first), then continue the standing mission. Journal a per-tick report as a comment on the '{{CONTROL_REPO}}' issue titled 'journal'. Be surgical; leave durable state (PRs, issue comments) for the next tick." \
-  --model {{MODEL_ID}} --effort {{EFFORT}} --dangerously-skip-permissions > "$R.log" 2>&1
+PROMPT="Ops tick: follow {{MISSION_DOC}} exactly. (1) Ops sweep. (2) PERCEPTION — enumerate EVERY open issue and PR across {{TARGET_REPOS}} and {{CONTROL_REPO}} ignoring 'last updated', carry a disposition per item (ranked / gated <which gate> / deferred <why>), and ASSERT THE COUNT; a delta-only sweep makes a filed-and-ignored item invisible forever. (3) Consume open '{{DIRECTIVE_LABEL}}' issues (priority:high first). (4) Advance the top non-gated item in the ranked queue, and re-rank the queue file in this same run if anything material changed. (5) Update the OWNING issue, not just the journal. (6) Journal a per-tick report as a comment on the '{{CONTROL_REPO}}' issue titled 'journal'. Be surgical; leave durable state (PRs, issue comments) for the next tick. FINALLY write the idle assertion to {{OPS_DIR}}/.tick-idle-ok.staged (never the live flag — the tick promotes it only on a clean exit): '1 <expiry_epoch>' IFF ops are healthy AND no actionable work remains AND every eligible top item is human-gated; otherwise '0'. Report honestly: if you could not verify something, say so — never write a green you did not observe."
+
+case "$HARNESS" in
+claude)
+  # `< /dev/null` is load-bearing: without it the CLI waits on stdin, and under cron or ssh that is
+  # a 3s stall at best and an indefinite hang at worst if the caller holds the pipe open.
+  timeout {{TICK_TIMEOUT_S}} claude -p "$PROMPT" \
+    --model {{MODEL_ID}} --effort {{EFFORT}} --dangerously-skip-permissions \
+    < /dev/null > "$R.log" 2>&1
+  ;;
+prime)
+  # --offline skips startup update checks only (provider calls still go out) — cron wants that.
+  # Autonomous mode replaces hand-rolled retries: the run may not finish until the gate passes.
+  PI_SKIP_VERSION_CHECK=1 timeout {{TICK_TIMEOUT_S}} prime-agent -p "$PROMPT" \
+    --provider {{PROVIDER}} --model {{MODEL_ID}} --thinking {{EFFORT}} \
+    --offline --cwd {{PROJECT_DIR}} \
+    --autonomous --autonomous-gate "{{TICK_GATE}}" \
+    --autonomous-max-turns {{TICK_MAX_TURNS}} --autonomous-timeout-ms {{TICK_TIMEOUT_MS}} \
+    < /dev/null > "$R.log" 2>&1
+  ;;
+esac
 RC=$?
+MODE={{PRIMARY_LEG_NAME}}
+
+# ---- fallback ladder: the primary's quota WILL run out, on a cycle you don't control ---------
+# Per-invocation, never sticky: we just tried the primary, and we will try it again next run. That
+# attempt IS the availability check, so the loop returns to the good seat by itself the moment the
+# allowance resets. No degraded-mode flag exists, deliberately. See playbooks/continuity.md §1.
+if [ $RC -ne 0 ] && [ -x "$OPS/fallback.sh" ]; then
+  "$OPS/fallback.sh" "$RC" "$R.log" "$PROMPT"
+  FRC=$?
+  # The ladder returns 0 only if some leg carried the run; otherwise it hands back the primary rc
+  # untouched, so a clean failure never becomes an ambiguous one.
+  [ $FRC -eq 0 ] && { RC=0; MODE=fallback; }
+fi
+
 # An auth failure must be LOUD — a revoked OAuth token once caused a silent 24h outage
-# (claude exits quickly, the log is ~74 bytes, and exit codes alone don't tell you).
+# (the harness exits quickly, the log is ~74 bytes, and exit codes alone don't tell you).
 find "$OPS/runs" -name "*.log" -mtime +14 -delete 2>/dev/null
-if grep -qE "529|Overloaded" "$R.log" 2>/dev/null && [ "$(stat -c%s "$R.log")" -lt 4096 ]; then
-  echo "$(date -u +%FT%TZ) API-OUTAGE rc=$RC — provider 529, cron will retry" >> "$OPS/runs/ticks.log"
-elif grep -qE "Failed to authenticate|OAuth.*revoked|401" "$R.log" 2>/dev/null; then
-  echo "$(date -u +%FT%TZ) AUTH-FAILURE rc=$RC — claude credentials dead, HUMAN NEEDED" >> "$OPS/runs/ticks.log"
+find ~/.prime/agent/sessions -name "*.jsonl" -mtime +30 -delete 2>/dev/null
+if grep -qE "529|Overloaded|rate.?limit" "$R.log" 2>/dev/null && [ "$(stat -c%s "$R.log")" -lt 4096 ]; then
+  echo "$(date -u +%FT%TZ) API-OUTAGE rc=$RC — provider throttled, cron will retry" >> "$OPS/runs/ticks.log"
+elif grep -qE "Failed to authenticate|OAuth.*revoked|401|Unauthorized|/login" "$R.log" 2>/dev/null; then
+  echo "$(date -u +%FT%TZ) AUTH-FAILURE rc=$RC — $HARNESS credentials dead, HUMAN NEEDED" >> "$OPS/runs/ticks.log"
   touch "$OPS/.tick-auth-broken"
 else
   rm -f "$OPS/.tick-auth-broken"
-  echo "$(date -u +%FT%TZ) exit=$RC" >> "$OPS/runs/ticks.log"
+  echo "$(date -u +%FT%TZ) exit=$RC harness=$HARNESS mode=$MODE" >> "$OPS/runs/ticks.log"
 fi
+
+# Consecutive-failure count is what the off-box watcher escalates on — a single bad run is noise,
+# a run of them is an outage. Promote the staged idle assertion only on a clean exit.
+if [ $RC -eq 0 ]; then echo 0 > "$OPS/state/.consec-fail"
+else echo $((CONSEC + 1)) > "$OPS/state/.consec-fail"; rm -f "$OPS/.tick-idle-ok.staged"; fi
+CONSEC=$(cat "$OPS/state/.consec-fail")
+heartbeat run_finished "$RC" "$MODE"
+
+# Exit with the RUN's status, not the heartbeat writer's. Without this the script returns whatever
+# the last command did — the best-effort `gh issue edit`, which succeeds — so a totally failed tick
+# exits 0 and anything supervising by exit status (cron MAILTO, a systemd unit, a wrapper) reads it
+# as healthy. The log said exit=1 and the process said 0. Found in an e2e run; see continuity.md §8.
+exit $RC

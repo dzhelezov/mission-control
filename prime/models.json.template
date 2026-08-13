@@ -1,0 +1,36 @@
+{
+  "_comment": [
+    "mission-control -> ~/.prime/agent/models.json  (rendered at setup; no {{VARS}} needed).",
+    "Prime Agent ships a built-in catalog per release, and as of 0.7.0 it already carries every",
+    "model in orchestration.example.toml — verified with `prime-agent model list <id>`. So this",
+    "file adds NO models; it only pins routing preferences on the metered ones.",
+    "",
+    "Merge semantics if you ever do need to add one: built-in models are kept, custom models are",
+    "upserted by id, and a matching id replaces the built-in entry. Check first —",
+    "`prime-agent model list <id>` needs credentials for that provider before it will list anything.",
+    "",
+    "data_collection: deny keeps prompts off providers that train on them. allow_fallbacks keeps a",
+    "single provider outage from stalling the resident session."
+  ],
+  "providers": {
+    "openrouter": {
+      "modelOverrides": {
+        "qwen/qwen3.8-max": {
+          "compat": {
+            "openRouterRouting": { "data_collection": "deny", "allow_fallbacks": true }
+          }
+        },
+        "moonshotai/kimi-k3": {
+          "compat": {
+            "openRouterRouting": { "data_collection": "deny", "allow_fallbacks": true }
+          }
+        },
+        "deepseek/deepseek-v4-flash-0731": {
+          "compat": {
+            "openRouterRouting": { "data_collection": "deny", "allow_fallbacks": true }
+          }
+        }
+      }
+    }
+  }
+}

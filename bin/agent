@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""agent — harness-agnostic one-shot dispatcher for the mission-control roster.
+
+Resolves  role -> model -> pool -> harness  from orchestration.toml and execs the right CLI.
+The caller never names a harness; swap a harness row in the config and every role follows.
+
+Usage:
+  agent --model qwen "prompt"            run a catalog model one-shot
+  agent --role reviewer -f diff.patch    run a role (system prompt from agents/<role>.md)
+  echo "..." | agent --model kimi        prompt from stdin
+  agent --model sol --tools "fix build"  give the harness its real tool loop (edits files!)
+  agent --list                           show the resolved catalog: model -> pool -> harness
+  agent --model opus --dry-run "x"       print the argv that would run, and exit
+
+Options:
+  --model KEY        model key from [models.*]           --effort L    off|minimal|low|medium|high|xhigh|max
+  --role NAME        role from [roles.*] + agents/NAME.md   -s TEXT    system prompt (overrides role)
+                     multi-seat roles (committee, brain+hands) run seat 0 — fan the seats out
+                     yourself with one call per seat, so they stay blind to each other
+  -f PATH            attach file as context (repeatable; '-' = piped stdin)
+  --tools            enable the harness tool loop (default: text-only, no file access)
+  --allow-metered    permit a metered pool for an Anthropic model (see guardrails)
+  --json             raw JSON response (http harness only)      -q     suppress the usage line
+  --config PATH      orchestration.toml to use              --dry-run  print argv, do not execute
+
+Config search order:
+  $MC_CONFIG · ./orchestration.toml · <repo>/orchestration.toml
+  · ~/.config/orchestration/orchestration.toml · ~/ops/orchestration.toml
+A missing config is not fatal: built-in defaults mirror orchestration.example.toml.
+
+Keys (never passed in argv):
+  $OPENROUTER_API_KEY · ~/.config/orchestration/openrouter.env · ~/ops/secrets/openrouter.env
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+# macOS still ships python3.9 as `python3`; TOML parsing needs 3.11+. Re-exec into a newer
+# interpreter once (guarded by an env flag) instead of making the kit depend on a pyenv shim.
+if sys.version_info < (3, 11) and not os.environ.get("MC_AGENT_REEXEC"):
+    for _cand in ("python3.14", "python3.13", "python3.12", "python3.11"):
+        _p = shutil.which(_cand)
+        if _p:
+            os.environ["MC_AGENT_REEXEC"] = "1"
+            os.execv(_p, [_p, os.path.abspath(__file__)] + sys.argv[1:])
+
+HERE = os.path.dirname(os.path.abspath(os.path.realpath(__file__)))
+REPO = os.path.dirname(HERE)
+
+KEY_FILES = [
+    os.path.expanduser("~/.config/orchestration/openrouter.env"),
+    os.path.expanduser("~/ops/secrets/openrouter.env"),
+]
+
+# Fallback catalog — mirrors orchestration.example.toml so the tool works before setup.
+DEFAULTS = {
+    "harnesses": {
+        "claude": {"cmd": "claude"},
+        "prime": {"cmd": "prime-agent"},
+        "codex": {"cmd": "codex"},
+        "http": {"cmd": ""},
+    },
+    "pools": {
+        "claude-max": {"billing": "subscription", "harness": "claude", "provider": "anthropic"},
+        "chatgpt-sub": {"billing": "subscription", "harness": "prime", "provider": "openai-codex",
+                        "alt_harness": "codex"},
+        "openrouter": {"billing": "metered", "harness": "prime", "provider": "openrouter",
+                       "fallback_harness": "http"},
+        "anthropic-api": {"billing": "metered", "harness": "prime", "provider": "anthropic"},
+    },
+    "models": {
+        "fable":  {"id": "claude-fable-5", "pool": "claude-max"},
+        "opus":   {"id": "claude-opus-5", "pool": "claude-max"},
+        "sonnet": {"id": "claude-sonnet-5", "pool": "claude-max"},
+        "sol":    {"id": "gpt-5.6-sol", "pool": "chatgpt-sub"},
+        "qwen":   {"id": "qwen/qwen3.8-max", "pool": "openrouter"},
+        "kimi":   {"id": "moonshotai/kimi-k3", "pool": "openrouter", "efforts": ["max"]},
+        "flash":  {"id": "deepseek/deepseek-v4-flash-0731", "pool": "openrouter",
+                   "efforts": ["high", "xhigh", "max"]},
+    },
+    "roles": {},
+    "guardrails": {"anthropic_subscription_only": True},
+}
+
+# Prime Agent's ladder is the superset; the others are clamped onto it.
+LADDER = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+CLAUDE_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+CODEX_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
+
+
+def die(msg):
+    sys.exit("agent: " + msg)
+
+
+def load_config(path=None):
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        die("python3.11+ required for TOML parsing (or pass --config with a pre-3.11 shim)")
+    candidates = [path] if path else [
+        os.environ.get("MC_CONFIG"),
+        os.path.join(os.getcwd(), "orchestration.toml"),
+        os.path.join(REPO, "orchestration.toml"),
+        os.path.expanduser("~/.config/orchestration/orchestration.toml"),
+        os.path.expanduser("~/ops/orchestration.toml"),
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c):
+            with open(c, "rb") as fh:
+                cfg = tomllib.load(fh)
+            for section, fallback in DEFAULTS.items():
+                merged = dict(fallback)
+                merged.update(cfg.get(section) or {})
+                cfg[section] = merged
+            cfg["_path"] = c
+            return cfg
+    if path:
+        die("config not found: " + path)
+    cfg = dict(DEFAULTS)
+    cfg["_path"] = None
+    return cfg
+
+
+def role_prompt(role):
+    """Body of agents/<role>.md (frontmatter stripped) = the role's system prompt."""
+    for base in (os.path.join(REPO, "agents"), os.path.expanduser("~/.claude/agents")):
+        p = os.path.join(base, role + ".md")
+        if not os.path.isfile(p):
+            continue
+        text = open(p).read()
+        meta = {}
+        if text.startswith("---"):
+            end = text.find("\n---", 3)
+            if end != -1:
+                for line in text[3:end].splitlines():
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        meta[k.strip()] = v.strip()
+                text = text[end + 4:]
+        return meta, text.strip()
+    return {}, None
+
+
+def resolve_role(cfg, role):
+    """Role -> (model_key, effort, system_prompt). Config seats win; the .md frontmatter fills gaps."""
+    meta, body = role_prompt(role)
+    seats = ((cfg.get("roles") or {}).get(role) or {}).get("seats") or []
+    seat = seats[0] if seats else {}
+    model = seat.get("model") or meta.get("model")
+    effort = seat.get("effort") or meta.get("effort")
+    if not model:
+        die("role '%s' has no model: add [roles.%s].seats or a `model:` in agents/%s.md"
+            % (role, role, role))
+    return model, effort, body
+
+
+def clamp(effort, allowed, harness_set=None):
+    """Snap the requested effort down to what this model/harness actually accepts."""
+    if not effort:
+        effort = "high"
+    if effort not in LADDER:
+        die("unknown effort '%s' (%s)" % (effort, "|".join(LADDER)))
+    ok = [e for e in LADDER if (not allowed or e in allowed) and
+          (harness_set is None or e in harness_set)]
+    if not ok:
+        return effort
+    if effort in ok:
+        return effort
+    below = [e for e in ok if LADDER.index(e) <= LADDER.index(effort)]
+    return below[-1] if below else ok[0]
+
+
+def load_key():
+    k = os.environ.get("OPENROUTER_API_KEY")
+    if k:
+        return k.strip()
+    for p in KEY_FILES:
+        try:
+            for line in open(p):
+                line = line.strip()
+                if line.startswith("OPENROUTER_API_KEY"):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except FileNotFoundError:
+            continue
+    die("no OPENROUTER_API_KEY in env or " + " / ".join(KEY_FILES))
+
+
+def http_oneshot(model_id, prompt, system, effort, raw_json, quiet):
+    """Zero-dependency OpenRouter client — the portable fallback harness."""
+    messages = ([{"role": "system", "content": system}] if system else []) + \
+               [{"role": "user", "content": prompt}]
+    body = {"model": model_id, "messages": messages,
+            "reasoning": {"effort": effort if effort in ("low", "medium", "high") else "high"}}
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions", data=json.dumps(body).encode(),
+        headers={"Authorization": "Bearer " + load_key(), "Content-Type": "application/json",
+                 "X-Title": "mission-control"})
+    try:
+        with urllib.request.urlopen(req, timeout=900) as resp:
+            payload = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        die("HTTP %s: %s" % (e.code, e.read().decode()[:500]))
+    except urllib.error.URLError as e:
+        die("network error: %s" % e)
+    if raw_json:
+        print(json.dumps(payload, indent=2))
+        return 0
+    print(((payload.get("choices") or [{}])[0].get("message") or {}).get("content", "").rstrip())
+    if not quiet:
+        u = payload.get("usage") or {}
+        sys.stderr.write("[%s via %s] in=%s out=%s cost=$%s\n" % (
+            model_id, payload.get("provider", "?"), u.get("prompt_tokens", "?"),
+            u.get("completion_tokens", "?"), u.get("cost", "?")))
+    return 0
+
+
+def build_argv(harness, hcfg, provider, model_id, effort, prompt, system, tools):
+    cmd = (hcfg.get("cmd") or harness)
+    if harness == "claude":
+        argv = [cmd, "-p", prompt, "--model", model_id,
+                "--effort", clamp(effort, None, CLAUDE_EFFORTS)]
+        if system:
+            argv += ["--append-system-prompt", system]
+        if tools:
+            argv += ["--dangerously-skip-permissions"]
+        return argv
+    if harness == "prime":
+        argv = [cmd, "-p", "--provider", provider, "--model", model_id,
+                "--thinking", effort, "--offline", "--no-session"]
+        if system:
+            argv += ["--append-system-prompt", system]
+        if not tools:
+            argv += ["--no-tools"]
+        return argv + [prompt]
+    if harness == "codex":
+        return [cmd, "exec", "-m", model_id,
+                "-c", "model_reasoning_effort=" + clamp(effort, None, CODEX_EFFORTS), prompt]
+    die("unknown harness '%s'" % harness)
+
+
+def main():
+    args = sys.argv[1:]
+    model_key = role = system = cfg_path = None
+    effort = None
+    files, prompt_parts = [], []
+    tools = raw_json = quiet = dry = allow_metered = do_list = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--model":
+            i += 1; model_key = args[i]
+        elif a == "--role":
+            i += 1; role = args[i]
+        elif a in ("-s", "--system"):
+            i += 1; system = args[i]
+        elif a in ("-f", "--file"):
+            i += 1; files.append(args[i])
+        elif a == "--effort":
+            i += 1; effort = args[i]
+        elif a == "--config":
+            i += 1; cfg_path = args[i]
+        elif a == "--tools":
+            tools = True
+        elif a == "--allow-metered":
+            allow_metered = True
+        elif a == "--json":
+            raw_json = True
+        elif a == "--dry-run":
+            dry = True
+        elif a == "--list":
+            do_list = True
+        elif a in ("-q", "--quiet"):
+            quiet = True
+        elif a in ("-h", "--help"):
+            print(__doc__); return 0
+        else:
+            prompt_parts.append(a)
+        i += 1
+
+    cfg = load_config(cfg_path)
+    models, pools, harnesses = cfg["models"], cfg["pools"], cfg["harnesses"]
+
+    if do_list:
+        print("config: %s" % (cfg["_path"] or "(built-in defaults)"))
+        for k, m in sorted(models.items()):
+            pool = pools.get(m.get("pool"), {})
+            h = pool.get("harness", "?")
+            avail = "" if (h == "http" or shutil.which(harnesses.get(h, {}).get("cmd") or h)) \
+                    else "  [!! %s not on PATH]" % (harnesses.get(h, {}).get("cmd") or h)
+            print("  %-7s %-24s %-13s %-6s %-9s%s" % (
+                k, m.get("id"), m.get("pool"), h, pool.get("billing", "?"), avail))
+        return 0
+
+    if role and not model_key:
+        model_key, role_effort, role_sys = resolve_role(cfg, role)
+        effort = effort or role_effort
+        system = system or role_sys
+    if not model_key:
+        die("pass --model KEY or --role NAME (see --list)")
+    if model_key not in models:
+        die("unknown model '%s' — known: %s" % (model_key, ", ".join(sorted(models))))
+
+    m = models[model_key]
+    pool_name = m.get("pool")
+    pool = pools.get(pool_name) or die("model '%s' names unknown pool '%s'" % (model_key, pool_name))
+    effort = clamp(effort, m.get("efforts"))
+
+    # Guardrail: an Anthropic model on a metered pool silently bills claude.ai extra usage
+    # per token instead of drawing on the Max/Pro plan. Refuse unless explicitly allowed.
+    if (cfg.get("guardrails") or {}).get("anthropic_subscription_only", True) \
+            and pool.get("provider") == "anthropic" and pool.get("billing") == "metered" \
+            and not allow_metered:
+        die("'%s' would run metered on pool '%s' — Anthropic models belong on harness=claude "
+            "(plan limits). Re-run with --allow-metered to spend extra-usage dollars." %
+            (model_key, pool_name))
+
+    harness = pool.get("harness")
+    model_id = m.get("id")
+    if not shutil.which((harnesses.get(harness) or {}).get("cmd") or harness):
+        for key in ("alt_harness", "fallback_harness"):
+            alt = pool.get(key)
+            if alt and (alt == "http" or shutil.which((harnesses.get(alt) or {}).get("cmd") or alt)):
+                if key == "fallback_harness" and m.get("alt_id"):
+                    model_id = m["alt_id"]
+                harness = alt
+                break
+        else:
+            die("harness '%s' for model '%s' is not installed (%s)" %
+                (harness, model_key, (harnesses.get(harness) or {}).get("install", "see CLAUDE.md")))
+
+    # Prompt + attached context
+    prompt = " ".join(prompt_parts).strip()
+    stdin_data = None if sys.stdin.isatty() else sys.stdin.read()
+    blocks = []
+    for f in files:
+        if f == "-":
+            if stdin_data is not None:
+                blocks.append("# piped stdin\n" + stdin_data); stdin_data = None
+        else:
+            blocks.append("# file: %s\n%s" % (f, open(f).read()))
+    if not prompt and stdin_data is not None:
+        prompt, stdin_data = stdin_data.strip(), None
+    if not prompt and not blocks:
+        die("no prompt (pass an arg, pipe stdin, or -f FILE)")
+    if blocks:
+        prompt = "\n\n".join(blocks) + "\n\n---\n\n" + prompt
+
+    if harness == "http":
+        if dry:
+            print("http-openrouter %s effort=%s" % (model_id, effort)); return 0
+        return http_oneshot(model_id, prompt, system, effort, raw_json, quiet)
+
+    argv = build_argv(harness, harnesses.get(harness) or {}, pool.get("provider"),
+                      model_id, effort, prompt, system, tools)
+    if dry:
+        print(" ".join(repr(a) if " " in a else a for a in argv)); return 0
+    if not quiet:
+        sys.stderr.write("[%s via %s/%s · %s · effort=%s]\n" % (
+            model_key, harness, pool.get("provider"), pool.get("billing"), effort))
+    return subprocess.call(argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

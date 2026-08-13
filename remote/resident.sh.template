@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# mission-control — prime-agent RESIDENT supervisor (rendered from resident.sh.template).
+#
+# This is NOT a tick loop. Under the prime harness the agent is a long-lived daemon-backed
+# session that owns its own cadence; cron's only job is to notice it died and bring it back.
+# The native machinery does the work the old tick.sh emulated by hand:
+#
+#   persistent goal      -> the standing mission, carried across turns and restarts
+#   native schedule      -> the ops tick (claim-before-deliver; missed ticks coalesce)
+#   heartbeats           -> in-session watch loops the agent creates for itself
+#   autonomous + gates   -> "not done until the gate passes", instead of a hand-rolled retry
+#   rlm() + harness      -> the roster, as refinable subagent specs (see prime/bootstrap.py)
+#   prime-agent send     -> the laptop steering the resident directly, without ssh
+#
+# Cron: */{{SUPERVISOR_MINUTES}} * * * *  {{OPS_DIR}}/resident.sh
+# Zero tokens when the resident is healthy.
+set -uo pipefail
+exec 9>{{OPS_DIR}}/.resident.lock; flock -n 9 || exit 0
+OPS={{OPS_DIR}}
+AGENT={{AGENT_NAME}}
+LOG="$OPS/runs/resident.log"
+say() { echo "$(date -u +%FT%TZ) $*" >> "$LOG"; }
+
+command -v prime-agent >/dev/null || { say "MISSING prime-agent on PATH"; exit 1; }
+[ -f ~/.prime/agent/auth.json ] || { say "AUTH-FAILURE no ~/.prime/agent/auth.json — HUMAN NEEDED"
+                                     touch "$OPS/.resident-auth-broken"; exit 1; }
+rm -f "$OPS/.resident-auth-broken"
+
+# Every `prime-agent` subcommand needs resolvable credentials before it will even print help, and
+# `list` exits 0 even when the daemon socket is missing. So: source the keys, and judge by parsed
+# output, never by exit status. (Verified against prime-agent 0.7.0.)
+for f in ~/ops/secrets/*.env; do [ -f "$f" ] && { set -a; . "$f"; set +a; }; done
+
+# jq is not assumed; --json + python is. `list --json` (without --all) returns only LIVE agents as
+# {"sessions":[{id,name?,lifecycle,isSessionActive,...}]}; `name` exists only after a rename.
+pa_field() { prime-agent list --json 2>/dev/null | python3 -c \
+  'import json,sys
+try: rows = json.load(sys.stdin).get("sessions") or []
+except Exception: rows = []
+for r in rows: print(r.get(sys.argv[1]) or "")' "$1" ; }
+
+# 1) Supervisor / daemon health. `doctor --fix` repairs service state; it is idempotent.
+prime-agent status 2>&1 | grep -qi "no background services" && \
+  { say "daemon down — doctor --fix"; prime-agent doctor --fix >>"$LOG" 2>&1; }
+
+# 2) Is the resident alive?
+if pa_field name | grep -qx "$AGENT"; then
+  say "resident $AGENT alive"
+else
+  say "resident $AGENT absent — starting"
+  # A resident session needs a pty; cron has none. tmux supplies one and keeps the client
+  # attached, so the daemon-backed worker is never orphaned by a hung terminal.
+  tmux kill-session -t "$AGENT" 2>/dev/null
+  tmux new-session -d -s "$AGENT" \
+    "PI_SKIP_VERSION_CHECK=1 prime-agent --cwd {{PROJECT_DIR}} \
+       --provider {{PROVIDER}} --model {{MODEL_ID}} --thinking {{EFFORT}} \
+       --goal '{{GOAL}}' --goal-token-budget {{GOAL_TOKEN_BUDGET}} \
+       --autonomous --autonomous-gate '{{GATE}}' \
+       --autonomous-max-turns {{MAX_TURNS}} --autonomous-timeout-ms {{AUTONOMOUS_TIMEOUT_MS}} \
+       >> '$OPS/runs/resident-session.log' 2>&1"
+  # Wait for the worker to register with the daemon rather than guessing a sleep length.
+  for _ in $(seq 1 20); do [ -n "$(pa_field id)" ] && break; sleep 3; done
+  # Give it the stable name the schedule and `prime-agent send` address it by.
+  NEW=$(pa_field id | head -1)
+  [ -n "${NEW:-}" ] && prime-agent rename "$NEW" "$AGENT" >>"$LOG" 2>&1
+  say "started $AGENT (id=${NEW:-unknown})"
+
+  # One-time: install the roster/policy into the continual harness.
+  if [ ! -f "$OPS/.harness-bootstrapped" ]; then
+    prime-agent send "$AGENT" "Run %run {{REPO_DIR}}/prime/bootstrap.py then await bootstrap() in the kernel, and report the harness overview." >>"$LOG" 2>&1 \
+      && touch "$OPS/.harness-bootstrapped"
+  fi
+fi
+
+# 3) The ops tick is a NATIVE schedule owned by the session, not a cron LLM invocation.
+if ! prime-agent schedule list --all --json 2>/dev/null | grep -q "{{DIRECTIVE_LABEL}}"; then
+  prime-agent schedule add "$AGENT" "*/{{TICK_MINUTES}} * * * *" -- \
+    "Ops tick: follow {{MISSION_DOC}} exactly — ops sweep first, then consume open '{{DIRECTIVE_LABEL}}' issues on {{CONTROL_REPO}} (priority:high first), then continue the standing goal. Journal a per-tick report as a comment on the '{{CONTROL_REPO}}' issue titled 'journal'. Be surgical; leave durable state (PRs, issue comments) for the next tick." \
+    >>"$LOG" 2>&1 && say "installed native schedule"
+fi
+
+# 4) Retention: session transcripts and supervisor logs.
+find "$OPS/runs" -name "*.log" -mtime +14 -delete 2>/dev/null
+find ~/.prime/agent/sessions -name "*.jsonl" -mtime +30 -delete 2>/dev/null

@@ -1,6 +1,6 @@
 ---
 name: deep-reasoner
-description: Deep research, architecture, and hard reasoning (Fable, max effort). Use PROACTIVELY for reasoning-heavy phases — system design, invariant/correctness analysis, root-cause investigation, tradeoff analysis, research synthesis, adversarial review. Returns decision-grade conclusions, not process.
+description: Deep research, architecture, and hard reasoning (top judgment seat, max effort). Use PROACTIVELY for reasoning-heavy phases — system design, invariant/correctness analysis, root-cause investigation, tradeoff analysis, research synthesis, adversarial review. Returns decision-grade conclusions, not process.
 model: fable
 effort: max
 ---

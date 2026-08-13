@@ -1,6 +1,10 @@
 # mission-control — orchestration config (shipped defaults; copy to orchestration.toml and edit)
-# Three layers: model catalog (data) → role schema (declared roles/seats) → routing (principles
-# live in docs/routing.md; re-derive assignments from the catalog by those principles).
+# Four layers, all data:
+#   0) HARNESS catalog  — how a model is actually reached, and who pays for it
+#   1) POOL catalog     — billing surfaces (subscription vs metered)
+#   2) MODEL catalog    — the taste/cost/intelligence matrix
+#   3) ROLE schema      — declared roles, N-wide seats, explicit escalation
+# Routing principles live in CLAUDE.md; re-derive assignments from the catalog by those principles.
 
 [deployment]
 control_repo = "you/your-mission-control-instance"   # private clone of this kit = the control repo
@@ -8,45 +12,226 @@ target_repos = ["you/your-project"]                  # where work products (PRs)
 tick_minutes = 45                                    # remote cadence (cron */45-style)
 journal_issue = "journal"                            # pinned issue label for tick reports
 directive_label = "directive"                        # issues the remote consumes as work
+tick_harness = "claude"                              # which harness drives the resident tick loop
+queue_file = "PRIORITIES.md"                         # the ONE ranked queue, in the target repo
+retro_cadence = "weekly, Tue 12:00 UTC"              # coded review; place it AFTER the quota reset
 
-# ── 1) MODEL CATALOG ─ the taste/cost/intelligence matrix, as data ──────────────────────────────
-# cost: higher = cheaper/flatter. intel: unsupervised problem-hardness. taste: code/design/API quality.
+# ── CONTINUITY ─ renders remote/fallback.sh, remote/deadman.yml, and the tick heartbeat ──────────
+# Read playbooks/continuity.md before editing. The short version: the primary WILL hit a quota wall,
+# an autonomous loop fails silently, and both are cheap to survive if you wire it before the outage.
+[continuity]
+primary_leg_name = "primary"      # heartbeat `mode` when the primary served the run
+fallback_effort  = "medium"       # fallback legs are for continuity, not for hard judgment calls
+fallback_key_file = "~/.config/orchestration/openrouter.env"   # extra key file, 600, never logged
+
+# THE LADDER, by catalog model name — ordered, tried after the primary fails. The installer resolves
+# each name to its base_url / key env var / id via its [pools.*] row, so this is not a second place
+# to update when a model moves pools. Keep it as names; do not paste slugs here.
+#
+# THE ONE RULE: each leg must sit on a DIFFERENT `scarcity` axis than the primary and than each
+# other. `qwen` (tokens) then `flash` (dollars) behind a subscription primary (rate) = three clocks,
+# no shared failure. Two rate-capped seats in a row is not a ladder, it is one seat written twice.
+# The last rung should be flash-class: its job is a live heartbeat and an honest journal, not quality.
+legs = ["qwen", "flash"]
+
+# Liveness. STALE_AFTER_S comes from MEASURED delivery, not the nominal cron: hosted sub-hourly
+# schedules coalesce and have been observed 51-96 min apart, and a bound below the real cadence
+# false-fires until the channel is ignored. 3h is a safe default for a 15-min nominal watcher.
+heartbeat_issue = 0               # issue number whose BODY the loop machine-edits (title: DO NOT COMMENT)
+alert_issue     = 0               # issue number where pages land as comments
+stale_after_s   = 10800
+max_consec_fail = 3
+page_cmd        = ""              # reads one line on stdin; e.g. gh issue comment N -R owner/repo -F -
+ops_health_cmd  = "true"          # exit 0 = healthy; vetoes a stale idle-skip. Replace with a real check.
+
+# ── 0) HARNESS CATALOG ─ a harness is an agent runtime, not a model ─────────────────────────────
+# `bin/agent` resolves model -> pool -> harness and builds the argv. Swap a harness row and every
+# role that uses it moves; no role definition changes.
+
+[harnesses.claude]
+cmd          = "claude"
+kind         = "agentic"                 # full tool loop, edits files, runs commands
+auth_file    = "~/.claude/.credentials.json"
+oneshot      = "claude -p {PROMPT} --model {ID} --effort {EFFORT}"
+system_flag  = "--append-system-prompt"
+yolo_flag    = "--dangerously-skip-permissions"
+providers    = ["anthropic"]
+# The ONLY harness that spends Claude Pro/Max plan limits instead of per-token dollars.
+
+[harnesses.prime]
+cmd          = "prime-agent"             # https://github.com/PrimeIntellect-ai/prime-agent
+kind         = "agentic"                 # one model-facing tool: a persistent IPython kernel
+install      = "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"
+auth_file    = "~/.prime/agent/auth.json"
+config_dir   = "~/.prime/agent"          # settings.json · models.json · AGENTS.md · agents/ · sessions/
+oneshot      = "prime-agent -p --provider {PROVIDER} --model {ID} --thinking {EFFORT}"
+system_flag  = "--append-system-prompt"
+providers    = ["openai-codex", "openrouter", "anthropic", "prime-inference", "zai", "moonshotai",
+                "google", "xai", "deepseek", "groq", "cerebras", "fireworks", "amazon-bedrock",
+                "azure-openai-responses", "google-vertex", "vercel-ai-gateway", "github-copilot"]
+# Reads CLAUDE.md/AGENTS.md as context files, so the mission doc works unchanged.
+# Autonomous mode (--autonomous --autonomous-gate CMD) replaces hand-rolled retry loops.
+
+[harnesses.codex]
+cmd          = "codex"
+kind         = "agentic"
+auth_file    = "~/.codex/auth.json"
+oneshot      = "codex exec -m {ID} -c model_reasoning_effort={EFFORT} {PROMPT}"
+providers    = ["openai-codex"]
+# Kept as the proven alternate seat for the ChatGPT subscription; same billing as prime+openai-codex.
+
+[harnesses.http]
+cmd          = ""                        # built into bin/agent (stdlib urllib, zero deps)
+kind         = "oneshot"                 # prompt in, answer out — no tools, no file access
+providers    = ["openrouter"]
+# The portable fallback: works on any box before prime-agent is installed. Peer/committee duty only.
+
+# ── 1) POOL CATALOG ─ what each surface actually costs ──────────────────────────────────────────
+
+# `scarcity` is the load-bearing field. THREE different things can stop a seat, and a fallback that
+# does not CROSS the axis is not a fallback: two rate-capped subscription seats go dry together.
+#   rate    — a subscription's periodic allowance. Free until it isn't, then hard-stops for days.
+#   dollars — metered credit. Degrades predictably; you can see it coming if you instrument it.
+#   tokens  — a prepaid token-plan. Its own clock, unrelated to the other two.
+# `resets` and `blast_radius` exist so "pick a leg on a different clock" is checkable, not taste.
+
+[pools.claude-max]
+billing  = "subscription"      # Claude Pro/Max plan limits; $0 marginal
+harness  = "claude"
+provider = "anthropic"
+scarcity = "rate"
+resets   = "weekly-ish; a heavy loop burns the allowance in 4-5 days"
+blast_radius = "every Anthropic seat at once — orchestrator AND any Claude committee seat"
+
+[pools.chatgpt-sub]
+billing      = "subscription"  # ChatGPT Plus/Pro; $0 marginal (OpenAI "Codex for OSS")
+harness      = "prime"
+provider     = "openai-codex"
+alt_harness  = "codex"         # `codex exec` — same subscription, older/proven path
+scarcity     = "rate"
+resets       = "own clock, independent of Anthropic"
+blast_radius = "the ChatGPT-sub seats only"
+
+[pools.maas]
+# A prepaid token-plan on a vendor's own managed endpoint. Usually Anthropic- or OpenAI-compatible,
+# so an existing CLI reaches it with an env swap. Its quota clock is independent of both
+# subscriptions, which is exactly what makes it a legitimate fallback leg — see playbooks/dispatch.md.
+billing      = "token-plan"
+harness      = "claude"        # via ANTHROPIC_BASE_URL swap; pin EVERY model slot (continuity.md §1)
+provider     = "anthropic-compatible"
+base_url     = "https://your-maas-endpoint.example/anthropic"
+scarcity     = "tokens"
+resets       = "weekly; a heavy loop can burn a week's plan in ~1 day"
+blast_radius = "this seat only"
+
+[pools.openrouter]
+billing          = "metered"   # real dollars per token; keep under [guardrails].metered_budget_usd
+harness          = "prime"
+provider         = "openrouter"
+fallback_harness = "http"      # bin/agent's built-in client when prime-agent isn't installed
+scarcity         = "dollars"
+resets           = "never — it empties and stays empty until topped up"
+blast_radius     = "EVERY metered seat plus the cheap continuity leg, all at once. Instrument it."
+
+[pools.anthropic-api]
+billing  = "metered"           # DO NOT route Claude models here by accident — see the guardrail below
+harness  = "prime"
+provider = "anthropic"
+# prime-agent's Anthropic OAuth draws from claude.ai *extra usage*, billed per token, NOT plan limits
+# (auth-flows.ts: ANTHROPIC_SUBSCRIPTION_AUTH_WARNING). Anthropic work belongs on harness=claude.
+
+# ── 2) MODEL CATALOG ─ the taste/cost/intelligence matrix, as data ──────────────────────────────
+# cost: higher = cheaper/flatter (subscription = 9). intel: unsupervised problem-hardness.
+# taste: code/design/API quality. Prices are USD per 1M tokens, verified 2026-08-06.
+
 [models.fable]
-id = "claude-fable-5"
-pool = "claude-max"        # subscription on Max; $-metered on API — the scarce judgment resource
+id      = "claude-fable-5"
+pool    = "claude-max"
+alt_id  = "anthropic/claude-fable-5"   # same weights via [pools.openrouter], metered ($10/$50)
 cost = 2
 intel = 9
 taste = 9
+efforts = ["low", "medium", "high", "xhigh", "max"]
 
 [models.opus]
-id = "claude-opus-4-8"
-pool = "claude-max"
+id      = "claude-opus-5"
+pool    = "claude-max"
+alt_id  = "anthropic/claude-opus-5"    # metered ($5/$25)
 cost = 4
-intel = 7
-taste = 8
+intel = 8
+taste = 9
+efforts = ["low", "medium", "high", "xhigh", "max"]
 
 [models.sonnet]
-id = "claude-sonnet-5"
+id   = "claude-sonnet-5"
 pool = "claude-max"
 cost = 5
-intel = 5
+intel = 6
 taste = 7
+efforts = ["low", "medium", "high", "xhigh"]
 
-[models.codex]
-id = "gpt-5.6-sol"         # verified live 2026-07-10 (needs codex CLI >= 0.144); prior default: "gpt-5.5"
-pool = "codex-sub"         # flat plan → $0 marginal; reached via `codex exec`
+[models.sol]
+id      = "gpt-5.6-sol"                # ChatGPT sub via prime-agent openai-codex, or `codex exec`
+pool    = "chatgpt-sub"
+alt_id  = "openai/gpt-5.6-sol"         # metered ($5/$30) via openrouter
 cost = 9
 intel = 8
-taste = 5
+taste = 6
+efforts = ["low", "medium", "high", "xhigh", "max"]
+
+[models.qwen]
+id     = "qwen3.8-max"                 # 1M ctx · text+image+video in
+pool   = "maas"                        # a PREPAID TOKEN-PLAN on the vendor's own endpoint...
+alt_id = "qwen/qwen3.8-max"            # ...or metered via [pools.openrouter] at $2/$6
+cost = 7
+intel = 7
+taste = 7
+efforts = ["low", "medium", "high", "xhigh"]
+# WHICH POOL YOU PUT THIS ON IS A DESIGN DECISION, not a detail. On the token-plan it is a seat with
+# an INDEPENDENT quota clock, which is what qualifies it as a fallback leg behind a subscription
+# primary. Move it to `openrouter` and you have bought a *fourth* seat on the pool that already
+# funds your cheap continuity leg — concentrating risk instead of spreading it.
+# Also present in prime-agent's built-in catalog via OpenRouter; prime/models.json.template pins
+# only the routing for that path.
 
 [models.glm]
-id = "z-ai/glm-5.2"        # via OpenRouter; reached via the `glm` CLI (peers/glm)
+id   = "z-ai/glm-5.2"                  # $0.76/$2.42 · the cheap capable seat
+pool = "openrouter"
+cost = 8
+intel = 7
+taste = 7
+efforts = ["low", "medium", "high", "xhigh"]
+# Earns its row as the CHEAP CHALLENGER: ~4x cheaper than kimi at a small taste/intel step down, so
+# it carries routine review rounds and keeps the expensive seats for decisions that deserve them.
+# It is also the standing failover for a subscription seat (see [roles.*].seats[].failover) — when
+# the Claude allowance is dry, this is what keeps a challenger on the committee at all.
+
+[models.flash]
+id   = "deepseek/deepseek-v4-flash-0731"  # 1,048,576 ctx · $0.09/$0.18 · near-frontier for pennies
 pool = "openrouter"
 cost = 9
 intel = 7
-taste = 8
+taste = 7
+efforts = ["high", "xhigh", "max"]     # built-in map nulls minimal/low/medium; xhigh -> provider `max`
+# The volume seat: hands, bulk, and context compression. A day of file-editing costs cents, which
+# is the point — it keeps volume off the subscription pools' weekly caps.
+# Direct DeepSeek (prime provider `deepseek`, id `deepseek-v4-flash`) is an alternative route;
+# OpenRouter is the default so one key covers every metered model. maxTokens is 65536 on this
+# dated snapshot vs 393216 on `deepseek/deepseek-v4-flash` — matters for long single outputs.
 
-# ── 2) ROLE SCHEMA ─ roles are declared, seats can be N-wide, escalation is explicit ────────────
+[models.kimi]
+id   = "moonshotai/kimi-k3"            # 1,048,576 ctx · $3/$15 · frontier-class non-US lineage
+pool = "openrouter"
+cost = 6
+intel = 8
+taste = 8
+efforts = ["max"]                      # built-in thinkingLevelMap nulls every level except `max`
+# The metered brain/taste seat. Frontier class, ~4x glm's price, and every call reasons at `max` —
+# watch [guardrails].metered_budget_usd, and give routine rounds to `glm` instead. THINKING-MODEL
+# TRAP: it writes `content` only after it stops reasoning, so a call with no `max_tokens` can bill
+# for a long think and return null content. Always cap it, with headroom. See continuity.md §4.
+
+# ── 3) ROLE SCHEMA ─ roles are declared, seats can be N-wide, escalation is explicit ────────────
 [roles.cto]                 # architecture, roadmap, specs, arbitration, taste-setting — periodic
 kind = "judgment"
 seats = [{ model = "fable", effort = "xhigh" }]
@@ -58,44 +243,197 @@ seats = [{ model = "fable", effort = "max" }]
 [roles.orchestrator]        # lean dispatcher + merge gate; the tick loop / the laptop main session
 kind = "dispatch"
 seats = [{ model = "opus", effort = "xhigh" }]
+# The tick loop's own continuity is the fallback ladder in [continuity], not a seat failover —
+# the ladder re-runs the whole tick, which is what you want when the primary is quota-dead.
 
-[roles.code]                # DEFAULT implementation = free-pool brain+hands pair
+[roles.code]                # DEFAULT implementation = frontier brain + near-free hands
 kind = "implement"
 seats = [
-  { model = "glm",   as = "brain" },   # drafts tasteful code/API/tests (text-only)
-  { model = "codex", as = "hands" },   # applies files, runs tests, iterates (one retry, then back to brain)
+  { model = "kimi",  as = "brain" },  # drafts tasteful code/API/tests over whole-repo context
+  { model = "flash", as = "hands" },  # applies files, runs tests, iterates (one retry, then brain)
 ]
+alt_hands = "sol"           # when you'd rather spend the ChatGPT sub than dollars, or need
+                            # cross-family execution for a verification pass
 [roles.code.escalation]
 model = "opus"
 effort = "xhigh"
 when = "taste-critical | correctness-critical | pair-stalls"
 
-[roles.review]              # per-PR committee, blind seats, per-seat lenses
+[roles.review]              # per-PR committee, blind seats, per-seat lenses, distinct lineages
 kind = "committee"
 seats = [
-  { model = "glm",   lens = "taste" },
-  { model = "codex", lens = "adversarial-empirical" },
-  { model = "opus",  lens = "judgment", when = "substantive" },
+  { model = "sol",  lens = "adversarial-empirical" },
+  { model = "glm",  lens = "conformance — does this match the directive it claims to execute?" },
+  { model = "kimi", lens = "taste + whole-repo context", when = "substantive" },
+  # `failover` is the seat-level twin of the tick's fallback ladder: try the subscription seat, drop
+  # to the cheap metered one when its allowance is dry. Per-call, never sticky, no probe. Without it
+  # a dead subscription silently drops the committee to ONE challenger — and one challenger plus a
+  # proposer is not a committee, it is a rubber stamp that still reports quorum.
+  { model = "opus", lens = "judgment", when = "substantive", failover = "glm" },
 ]
 [roles.review.arbiter]
 model = "fable"
+failover = "sol"            # an arbiter must never be its own challenger, or its own fallback
 when = "split | invariant-critical"
+
+[roles.long-context]        # whole-repo sweeps, cross-file invariants, migration audits
+kind = "survey"
+seats = [{ model = "kimi", effort = "max" }]
 
 [roles.mechanical]          # bulk/boilerplate/formatting/running suites
 kind = "execute"
-seats = [{ model = "codex" }]          # free pool default
-# alternative in-harness seat (near-dominated; enable if you prefer Claude-native mechanical):
-# seats = [{ model = "sonnet", effort = "low" }]
+seats = [{ model = "flash", effort = "high" }]
+# alternatives: { model = "sol" } to spend subscription instead of dollars;
+#               { model = "sonnet", effort = "low" } for in-harness Claude-native mechanical work
 
-# ── 3) GUARDRAILS (parameterized per deployment; rendered into the remote mission doc) ──────────
+[roles.compress]            # distillation: raw logs/diffs/ledgers -> a briefing packet for judgment
+kind = "execute"
+seats = [{ model = "flash", effort = "high" }]
+# 1M context at $0.09/M is what makes "never send raw dumps to the CTO" affordable.
+
+# ── 3b) DISPATCH POLICY ─ cost × skill × quota, as data you can recompute ───────────────────────
+# The role table above is the CURRENT ANSWER. This block is the POLICY that produced it, so when a
+# model ships or a price moves you re-derive instead of guessing. The method — and the monthly
+# re-derivation ritual — is playbooks/dispatch.md. Catalogs move roughly monthly; assume this block
+# is stale and check it.
+
+[dispatch]
+# Spend the flat things first. A subscription second is free; a metered second is not. But note the
+# inversion that catches everyone: subscription pools are capped by RATE, so burning them on bulk
+# work costs you the judgment calls you cannot make later. Cheap-metered exists to protect the caps.
+scarcity_preference = ["rate", "tokens", "dollars"]
+
+# Quota handling is the B-pattern from continuity.md §1, applied to seats instead of the tick:
+# try the seat, fall through on failure, never mark it down. No probe — a probe against a thinking
+# model certifies a dead seat as healthy (continuity.md §4), which is worse than no probe at all.
+on_seat_unavailable = "fall_through"
+never_probe_seats   = true
+
+# Capability floors: the MINIMUM a class needs, so a cheaper model that clears the bar wins on
+# price. Raise a floor when output quality disappoints; never raise a model above its floor "to be
+# safe" — that is how bulk work ends up on the seat you needed for arbitration.
+[dispatch.classes.bulk]        # boilerplate, formatting, file application, running suites
+floor      = { intel = 6, taste = 5 }
+candidates = ["flash", "glm", "sol"]
+
+[dispatch.classes.compress]    # raw logs/diffs -> briefing packet. Needs context, not taste.
+floor      = { intel = 6, context = "1M" }
+candidates = ["flash", "kimi"]
+
+[dispatch.classes.draft]       # code/API/test authorship
+floor      = { intel = 7, taste = 8 }
+candidates = ["kimi", "opus", "fable"]
+
+[dispatch.classes.review]      # committee seats. DIVERSITY is the requirement, not raw score.
+floor        = { intel = 7 }
+candidates   = ["sol", "glm", "kimi", "opus", "qwen"]
+min_lineages = 2               # distinct model families; same-lineage reviewers share blind spots
+min_live     = 2               # challengers that actually ANSWERED this round, not that were listed
+
+[dispatch.classes.judgment]    # architecture, arbitration, final gates. Convene sparingly.
+floor      = { intel = 8, taste = 9 }
+candidates = ["fable", "opus", "sol"]
+
+# ── 3c) CODED ROUTINES ─ the harness improving itself, on a cadence, with a reviewer ────────────
+# Rendered into remote/routine.sh + cron. Each routine gets the four things that separate a real
+# routine from a documented intention: a cadence, a non-author reviewer, a fail-closed page when it
+# does not happen, and a durable artifact. Nothing here is "a human periodically re-reads the config".
+#
+# THE BOUND: a routine PROPOSES via `proposes` (a PR path) and never edits governance in place. A
+# loop that can silently rewrite its own review rules has no review rules. See
+# playbooks/self-improvement.md.
+
+[routines.retro]
+cadence  = "weekly"
+cron     = "0 12 * * 2"        # place it AFTER the subscription reset, never before: the hours
+                               # before a reset are when the primary is most likely dead, and a
+                               # retro that only lands in healthy weeks misses the weeks worth having
+reviewer = "cto"               # not the author. The resident writes it; the judgment seat reviews it
+artifact = "retros/{date}.md"
+proposes = "orchestration.toml"
+agenda = """
+1. Incidents since the last retro: what broke, what caught it, what SHOULD have caught it.
+2. Every instrument that reported green through a real failure — the recurring class. For each,
+   name the negative control that would have caught it, and add it.
+3. Deferred residue from the ranked queue: still deferred, or now load-bearing?
+4. Cost: spend per pool vs. last period; any pool whose blast radius has grown.
+5. Decoration audit: standing rules with no cadence, owner or mechanical check. Code them or drop
+   them — do not restate them.
+6. What did the human have to catch that the harness should have? That count is the maturity KPI
+   and its target is zero.
+"""
+
+[routines.catalog-refresh]
+cadence  = "monthly"
+cron     = "0 13 1 * *"
+reviewer = "orchestrator"
+artifact = "retros/catalog-{date}.md"
+proposes = "orchestration.toml"
+agenda = """
+Re-derive dispatch from live data — this replaces a human periodically rewriting the model table.
+1. Fetch CURRENT prices, context limits and availability for every [models] row from the provider.
+   Not from memory, not from this file. Flag anything that moved >2x or vanished.
+2. Search for models that have shipped since the last run and clear a [dispatch.classes.*] floor
+   more cheaply than the incumbent.
+3. Re-sort each class's candidates: cheapest model clearing the floor wins.
+4. Verify every fallback chain still CROSSES scarcity axes, and that no class sits entirely on one
+   pool. Recheck each pool's blast_radius against what it now funds.
+5. Open a PR moving the role table to match, with a stated reason per change. Do not merge it.
+"""
+
+[routines.seat-election]
+cadence  = "monthly"
+cron     = "0 14 1 * *"
+reviewer = "deep-reasoner"     # must NOT be an incumbent of the seat under review
+artifact = "retros/seats-{date}.md"
+proposes = "orchestration.toml"
+agenda = """
+Which model holds which seat is settled by EVIDENCE, not by decree or by inertia.
+1. Pull the period's real artifacts per seat: verdicts, findings, PRs, escalations.
+2. Score on what actually happened — findings that survived challenge, defects caught vs. missed,
+   whether it exercised the artifact or only read it, availability during the period.
+3. Watch for a like-for-like trap: a seat only ever given one KIND of task has not been compared
+   fairly against one given the full range. Say so rather than ranking through it.
+4. Re-run a small bake-off on RECORDED real tasks for any seat whose evidence is thin.
+5. Check the governance floor still holds: >=2 live challengers, distinct lineages, no seat that is
+   its own challenger or its own fallback.
+6. Open a PR with any seat change and the evidence for it. An incumbent may not review its own seat.
+"""
+
+[routines.roadmap-pass]
+cadence  = "daily"
+cron     = "0 6 * * *"
+reviewer = "cto"
+artifact = "{{QUEUE_FILE}}"
+proposes = ""                  # report-only: it rewrites the queue it owns, not the governance
+agenda = """
+1. Enumerate EVERY open issue and PR across all target repos, ignoring 'last updated'.
+2. Disposition each: ranked / gated (name the gate) / deferred (name the reason). Assert the count,
+   and state the denominator you counted over — a correct count over the wrong set reads as coverage.
+3. Re-rank the queue file. Project delivery above harness work. One file, no competing list.
+4. For anything ranked top-N, confirm the OWNING issue reflects reality; update it if not.
+5. Name the single next non-gated action.
+"""
+
+# ── 4) GUARDRAILS (parameterized per deployment; rendered into the remote mission doc) ──────────
 [guardrails]
 human_reserved = [
   "publish to package registries (until gated release-automation is proven)",
   "external outreach",
   "merges to production docs/sites",
-  "spend beyond budget_usd",
+  "spend beyond metered_budget_usd",
 ]
-budget_usd = 50
+metered_budget_usd = 50       # applies to [pools.*] with billing = "metered" only
+anthropic_subscription_only = true   # HARD RULE: Anthropic models run on harness=claude.
+                                     # bin/agent refuses to route them through a metered pool
+                                     # unless you pass --allow-metered. Flipping this to false
+                                     # converts your Max plan into a per-token bill.
 public_surface_rule = true    # never post infra internals to public repos
 secret_scan = true            # pre-commit/pre-push scans; keys env-file-only (600), never argv
 workflow_scope = "human"      # workflow-file pushes stay human (PAT has no workflow scope)
+
+[upstream]                    # etiquette on repos we do NOT own — see playbooks/upstream-contribution.md
+mode = "contributor"          # observer (read-only) | contributor (fork + PRs) | committer (human-granted)
+max_open_prs = 2              # per upstream repo; no new PR until an earlier one gets a response
+claim_before_coding = true    # comment on the issue and wait a day before starting
+never_touch = [".github/workflows/", "release configs", "CI credentials"]

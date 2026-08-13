@@ -1,0 +1,92 @@
+# mission-control — OFF-BOX DEAD-MAN (leg 2 of three; see playbooks/continuity.md §2).
+# Render to .github/workflows/deadman.yml in the CONTROL REPO (private).
+#
+# Why off-box: on-box monitoring cannot report that the box is gone. This job watches the heartbeat
+# the loop writes and pages when it goes stale — so a dead loop is noticed in minutes, not overnight.
+#
+# NOTE ON SCOPE: pushing workflow files requires the `workflow` scope, which the kit deliberately
+# withholds from the resident's PAT. Install this file by hand, from the laptop tier.
+name: deadman
+
+on:
+  schedule:
+    # Offset minutes on purpose: hosted crons queue heavily at :00. This is a REQUEST, not a promise
+    # — sub-hourly schedules coalesce and have been measured delivering 51-96 min apart under load.
+    # STALE_AFTER_S below is set from that measured worst case, NOT from this interval.
+    - cron: '9,24,39,54 * * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Parse heartbeat and page on staleness
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEARTBEAT_ISSUE: '{{HEARTBEAT_ISSUE}}'   # issue whose body the loop machine-edits
+          ALERT_ISSUE: '{{ALERT_ISSUE}}'           # issue where pages land as comments
+          STALE_AFTER_S: '{{STALE_AFTER_S}}'       # from MEASURED delivery worst case + margin
+          MAX_CONSEC_FAIL: '{{MAX_CONSEC_FAIL}}'
+        run: |
+          set -uo pipefail
+
+          # Fail CLOSED. Every failure to read or parse the heartbeat is treated as "the loop is
+          # dead", never as "probably fine". A watcher that fails open is not a watcher.
+          fail_closed() {
+            echo "DEADMAN-FIRE: $1"
+            gh issue comment "$ALERT_ISSUE" --repo "$REPO" \
+              --body "🔴 **DEADMAN** $(date -u +%FT%TZ) — $1"$'\n\n'"Loop liveness cannot be confirmed. Check the resident host." \
+              || echo "page delivery FAILED (correlated-channel risk — see continuity.md §2)"
+            exit 1
+          }
+
+          BODY=$(gh issue view "$HEARTBEAT_ISSUE" --repo "$REPO" --json body -q .body 2>/dev/null) \
+            || fail_closed "cannot read heartbeat issue #$HEARTBEAT_ISSUE"
+          [ -n "$BODY" ] || fail_closed "heartbeat issue #$HEARTBEAT_ISSUE is empty"
+
+          # Strict parse. The loop writes ONE fenced JSON object; anything else is a fault.
+          # jq (preinstalled on GitHub runners) rather than an inline script: a multi-line here-doc
+          # inside a YAML block scalar has to stay indented, and indented Python does not run.
+          REC=$(printf '%s' "$BODY" | sed -n '/^```json$/,/^```$/p' | sed '1d;$d')
+          [ -n "$REC" ] || fail_closed "no fenced json record in the heartbeat"
+
+          # Two traps here, both found by driving this against real input rather than synthetic input:
+          #  1. Check for null BEFORE stringifying — `(.missing|tostring)` yields the string "null",
+          #     which is truthy, so `jq -e` alone waves an incomplete record through.
+          #  2. `rc` is LEGITIMATELY null in the `run_started` phase: the run has not finished, so it
+          #     has no exit code yet. Requiring it non-null pages a false alarm every time the watcher
+          #     lands while a tick is in flight — which is most of them on a long tick. That is how a
+          #     dead-man channel earns the "ignore it, it always cries wolf" reputation and stops
+          #     being a dead-man at all. Require the KEY to exist; allow the VALUE to be null.
+          FIELDS=$(printf '%s' "$REC" | jq -er '
+            if (.at != null and .consec_fail != null and .mode != null and has("rc"))
+            then [.at, (.rc|tostring), (.consec_fail|tostring), .mode] | @tsv
+            else error("missing required field") end') \
+            || fail_closed "heartbeat unparseable or missing keys (at/consec_fail/mode, rc key)"
+          IFS=$'\t' read -r AT RC CONSEC MODE <<< "$FIELDS"
+
+          NOW=$(date -u +%s)
+          THEN=$(date -u -d "$AT" +%s 2>/dev/null) || fail_closed "unparseable timestamp: $AT"
+          AGE=$(( NOW - THEN ))
+
+          if [ "$AGE" -gt "$STALE_AFTER_S" ]; then
+            fail_closed "heartbeat is ${AGE}s old (bound ${STALE_AFTER_S}s); last rc=$RC mode=$MODE"
+          fi
+          if [ "$CONSEC" -ge "$MAX_CONSEC_FAIL" ]; then
+            fail_closed "$CONSEC consecutive failed runs (bound $MAX_CONSEC_FAIL); mode=$MODE"
+          fi
+
+          echo "OK age=${AGE}s rc=$RC consec_fail=$CONSEC mode=$MODE"
+
+          # Resolve a previously-open page so the channel returns to quiet on its own.
+          LAST=$(gh issue view "$ALERT_ISSUE" --repo "$REPO" --json comments \
+                   -q '[.comments[].body] | map(select(startswith("🔴 **DEADMAN**") or startswith("🟢 **DEADMAN CLEAR**"))) | last // ""')
+          case "$LAST" in
+            '🔴 **DEADMAN**'*)
+              gh issue comment "$ALERT_ISSUE" --repo "$REPO" \
+                --body "🟢 **DEADMAN CLEAR** $(date -u +%FT%TZ) — heartbeat healthy (age ${AGE}s, rc=$RC, mode=$MODE)." ;;
+          esac
