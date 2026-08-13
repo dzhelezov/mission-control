@@ -13,6 +13,37 @@ tick_minutes = 45                                    # remote cadence (cron */45
 journal_issue = "journal"                            # pinned issue label for tick reports
 directive_label = "directive"                        # issues the remote consumes as work
 tick_harness = "claude"                              # which harness drives the resident tick loop
+queue_file = "PRIORITIES.md"                         # the ONE ranked queue, in the target repo
+retro_cadence = "weekly, Tue 12:00 UTC"              # coded review; place it AFTER the quota reset
+
+# ── CONTINUITY ─ renders remote/fallback.sh, remote/deadman.yml, and the tick heartbeat ──────────
+# Read playbooks/continuity.md before editing. The short version: the primary WILL hit a quota wall,
+# an autonomous loop fails silently, and both are cheap to survive if you wire it before the outage.
+[continuity]
+primary_leg_name = "primary"      # heartbeat `mode` when the primary served the run
+fallback_effort  = "medium"       # fallback legs are for continuity, not for hard judgment calls
+fallback_key_file = "~/.config/orchestration/openrouter.env"   # extra key file, 600, never logged
+
+# Leg 2: a second seat on a DIFFERENT quota clock. Same shape as the primary, different vendor.
+leg2_base_url = "https://your-second-provider.example/api"
+leg2_key_var  = "SECOND_PROVIDER_API_KEY"    # env var name; the VALUE lives in a 600 env file
+leg2_model    = "vendor/second-seat-model"
+
+# Leg 3: the continuity floor. A flash-class model at cents per run, on a pool that cannot share a
+# quota clock with anything above it. Its job is a live heartbeat and an honest journal, not quality.
+leg3_base_url = "https://openrouter.ai/api"  # note: no /v1 — the CLI appends /v1/messages
+leg3_key_var  = "OPENROUTER_API_KEY"
+leg3_model    = "vendor/some-flash-model"
+
+# Liveness. STALE_AFTER_S comes from MEASURED delivery, not the nominal cron: hosted sub-hourly
+# schedules coalesce and have been observed 51-96 min apart, and a bound below the real cadence
+# false-fires until the channel is ignored. 3h is a safe default for a 15-min nominal watcher.
+heartbeat_issue = 0               # issue number whose BODY the loop machine-edits (title: DO NOT COMMENT)
+alert_issue     = 0               # issue number where pages land as comments
+stale_after_s   = 10800
+max_consec_fail = 3
+page_cmd        = ""              # reads one line on stdin; e.g. gh issue comment N -R owner/repo -F -
+ops_health_cmd  = "true"          # exit 0 = healthy; vetoes a stale idle-skip. Replace with a real check.
 
 # ── 0) HARNESS CATALOG ─ a harness is an agent runtime, not a model ─────────────────────────────
 # `bin/agent` resolves model -> pool -> harness and builds the argv. Swap a harness row and every

@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# mission-control — FALLBACK LADDER (rendered from fallback.sh.template; {{VARS}} filled at setup).
+#
+# Called by tick.sh when the primary model path fails. Runs the SAME prompt on progressively
+# cheaper, independently-billed model seats until one succeeds. See playbooks/continuity.md §1.
+#
+# Contract with the caller:
+#   in   $1 = primary exit code   $2 = primary log path   $3 = the prompt (verbatim, byte-identical)
+#   out  exit 0 if some leg succeeded; otherwise the PRIMARY's exit code, unchanged.
+#   NEVER: turn a clean primary failure into an ambiguous one. Errors in here are logged and
+#          swallowed, and the primary rc falls through.
+#
+# Invariants you must not "simplify" away:
+#   * Per-invocation, never sticky. No degraded-mode flag exists. tick.sh tries the primary on EVERY
+#     run; that attempt IS the availability check, so the loop self-returns the moment quota resets.
+#   * EVERY model slot the CLI reads is pinned. A compat proxy serves whatever id you send it, so a
+#     leaked default silently buys the expensive model through the expensive route.
+#   * Each leg gets a SCRATCH config dir. CLIs prefer a stored credentials file over your env var.
+#   * The key is passed by environment only — never argv, never echoed, never logged.
+set -uo pipefail
+
+PRIMARY_RC="${1:?primary rc}"; PRIMARY_LOG="${2:-/dev/null}"; PROMPT="${3:?prompt}"
+OPS={{OPS_DIR}}
+STAMP=$(date -u +%Y%m%dT%H%M)
+say() { echo "$(date -u +%FT%TZ) [fallback] $*" >> "$OPS/runs/fallback.log"; }
+
+# ---- classify the primary failure ------------------------------------------------------------
+# Only quota/rate/overload failures are worth re-running elsewhere. A crash in our own code, a bad
+# prompt, or a git conflict will fail identically on every leg and just burns money.
+CLASS=unclassified
+if grep -qiE "quota|rate.?limit|429|usage limit|allowance|insufficient.?(credit|balance)" \
+      "$PRIMARY_LOG" 2>/dev/null; then CLASS=quota
+elif grep -qiE "529|overloaded|502|503|504|timed? ?out" "$PRIMARY_LOG" 2>/dev/null; then CLASS=transient
+elif grep -qiE "Failed to authenticate|OAuth.*revoked|401|Unauthorized|/login" \
+      "$PRIMARY_LOG" 2>/dev/null; then CLASS=auth
+fi
+say "primary rc=$PRIMARY_RC class=$CLASS"
+
+# An auth failure is a HUMAN problem — a fallback hides it. Page and stop.
+if [ "$CLASS" = auth ]; then
+  say "AUTH-FAILURE — not falling back; a dead credential must stay loud"
+  exit "$PRIMARY_RC"
+fi
+
+# ---- page once per window (dedup so a long outage doesn't spam the channel) --------------------
+# Deliberately generic: {{PAGE_CMD}} receives a one-line body on stdin. Wire it to whatever the
+# deployment already uses (a gh issue comment, a webhook, mail). Empty = no paging.
+page() {
+  local marker="$OPS/state/.paged-$(date -u +%Y%m%d)"
+  [ -n "{{PAGE_CMD}}" ] || return 0
+  [ -f "$marker" ] && return 0
+  mkdir -p "$OPS/state" && : > "$marker"
+  printf '%s\n' "$1" | {{PAGE_CMD}} >/dev/null 2>&1 || say "page command failed (non-fatal)"
+}
+page "LOOP-FALLBACK $(date -u +%FT%TZ): primary failed rc=$PRIMARY_RC class=$CLASS — descending the ladder. Subscription allowances reset on their own cycle; the loop retries the primary every run and returns to it automatically."
+
+# ---- the ladder ------------------------------------------------------------------------------
+# run_leg <name> <base_url> <key_env_var> <model_slug> <config_dir>
+# One function, because every leg is the same env-swap recipe with different values. Add a leg by
+# adding a call at the bottom; order = descending cost, ascending resilience.
+run_leg() {
+  local name="$1" base="$2" keyvar="$3" model="$4" cfg="$5"
+  local log="$OPS/runs/$STAMP.$name.log"
+
+  local key="${!keyvar:-}"
+  if [ -z "$key" ]; then say "leg $name SKIPPED — no key in \$$keyvar"; return 1; fi
+
+  mkdir -p "$cfg"
+  say "leg $name STARTING model=$model"
+
+  # Subshell: the env swap must not leak into the next leg or back to the caller.
+  (
+    export ANTHROPIC_BASE_URL="$base"
+    export ANTHROPIC_API_KEY="$key"
+    # Pin EVERY slot. Anything left unset falls back to a CLI default — which on a compat proxy is
+    # served as that literal model, at that vendor's price, through the wrong billing path.
+    export ANTHROPIC_MODEL="$model"
+    export ANTHROPIC_SMALL_FAST_MODEL="$model"
+    export ANTHROPIC_DEFAULT_OPUS_MODEL="$model"
+    export ANTHROPIC_DEFAULT_SONNET_MODEL="$model"
+    export ANTHROPIC_DEFAULT_HAIKU_MODEL="$model"
+    export CLAUDE_CONFIG_DIR="$cfg"
+    # A stored OAuth token outranks the API key we just set. Remove it for this leg only.
+    unset CLAUDE_CODE_OAUTH_TOKEN
+    export DISABLE_TELEMETRY=1 DISABLE_AUTOUPDATER=1 DISABLE_ERROR_REPORTING=1
+    cd {{PROJECT_DIR}} || exit 90   # never inherit the caller's cwd; see continuity.md §9
+    timeout {{TICK_TIMEOUT_S}} claude -p "$PROMPT" \
+      --model "$model" --effort {{FALLBACK_EFFORT}} --dangerously-skip-permissions
+  ) > "$log" 2>&1
+  local rc=$?
+
+  if [ $rc -eq 0 ]; then
+    say "leg $name OK rc=0 log=$(basename "$log")"
+    # Prove it, don't assume it: confirm which model ids actually went out. A leg that "worked" by
+    # silently serving the expensive model is a billing incident, not a success.
+    if grep -qE '"model" *: *"' "$log" 2>/dev/null && \
+       grep -oE '"model" *: *"[^"]+"' "$log" | grep -qv "$(printf '%s' "$model" | tr -d '~')"; then
+      say "WARNING leg $name served an unexpected model id — inspect $log before trusting this run"
+    fi
+    return 0
+  fi
+  say "leg $name FAILED rc=$rc log=$(basename "$log")"
+  return 1
+}
+
+# Load keys from env files (600). Never echo them.
+for f in "$OPS"/secrets/*.env; do [ -f "$f" ] && { set -a; . "$f"; set +a; }; done
+[ -f "{{FALLBACK_KEY_FILE}}" ] && { set -a; . "{{FALLBACK_KEY_FILE}}"; set +a; }
+
+# Drill hooks — force a leg without waiting for a natural double failure (continuity.md §1).
+# tick.sh never sets these; only a human or the scheduled drill does.
+: "${SKIP_LEG_2:=}"
+
+# LEG 2 — a second subscription/token-plan seat. Different vendor, different quota clock.
+if [ -z "$SKIP_LEG_2" ]; then
+  run_leg leg2 "{{LEG2_BASE_URL}}" "{{LEG2_KEY_VAR}}" "{{LEG2_MODEL}}" "$OPS/state/leg2-cfg" && exit 0
+else
+  say "leg2 force-skipped (drill)"
+fi
+
+# LEG 3 — the continuity floor. A flash-class model at cents per run, on a pool that does not
+# share a quota clock with anything above it. Quality is not the point; a live heartbeat is.
+run_leg leg3 "{{LEG3_BASE_URL}}" "{{LEG3_KEY_VAR}}" "{{LEG3_MODEL}}" "$OPS/state/leg3-cfg" && exit 0
+
+say "ALL LEGS FAILED — surfacing the primary rc=$PRIMARY_RC"
+page "LOOP-DOWN $(date -u +%FT%TZ): every fallback leg failed. HUMAN NEEDED."
+exit "$PRIMARY_RC"

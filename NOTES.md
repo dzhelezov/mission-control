@@ -1,15 +1,17 @@
 # mission-control — design
 
-**A reproducible, installable two-tier Claude Code orchestration: a human-driven laptop gateway +
+**A reproducible, installable two-tier agent orchestration: a human-driven laptop gateway +
 a 24/7 autonomous remote session, coordinated through GitHub-native primitives.**
 
-Clone the repo, open Claude Code in it, and it completes its own setup — asking for tokens and
+Clone the repo, open a coding agent in it, and it completes its own setup — asking for tokens and
 access only when and where needed. Then the remote tier works autonomously on goals the laptop
 tier sets; the laptop observes, steers, deep-dives, or takes over for direct work when online.
 
-This kit is *extracted from a production deployment* (the portal-ponder campaign, 2026-07): every
-default, guardrail, and discipline here survived contact with real work. `extracted/` holds the
-raw artifacts from that deployment; the build generalizes them.
+This kit is *extracted from production deployments*: every default, guardrail, and discipline here
+survived contact with real work, and most of them exist because something failed first. Where a rule
+looks oddly specific, that is why — `playbooks/continuity.md` carries the operational ones with the
+failure that produced each. Nothing here is tied to a particular project; the kit ships only the
+generalized mechanism.
 
 ---
 
@@ -42,8 +44,8 @@ systemd slice) on an existing box** — isolated home, scoped sudoers, own secre
 3. **Routing principles** — the policy that re-derives assignments when the catalog changes:
    ship-quality ordering intel > taste > cost · taste ≥ 7 for anything that ships · judge the
    output, not the price tag · volume → free/flat pools · judgment → the best brain · blind
-   multi-track for high-stakes. Documented in `docs/routing.md` so a future maintainer can
-   re-tune defaults by the same reasoning that produced them.
+   multi-track for high-stakes. Stated in `CLAUDE.md` (*Routing principles*) so a future maintainer
+   can re-tune defaults by the same reasoning that produced them.
 
 **Shipped defaults** (proven cost/value: Claude Max + ChatGPT sub + OpenRouter credits):
 fable = CTO/deep-reasoner (judgment); opus = orchestrator + escalation coder + committee-judgment
@@ -88,6 +90,30 @@ ssh · `refine.run()` to turn repeated failures into durable harness state. `pri
 compiles `orchestration.toml` + `agents/*.md` into that harness state, resolving every model id to a
 live `rlm.find_models` selector so an unreachable model fails at bootstrap, not mid-mission.
 
+## 2d. Continuity: the loop must outlive its own model
+
+The single largest gap between "a cron job that calls a model" and something you can leave running
+is that **the model path dies on a schedule you do not control**, and when it does, an autonomous
+loop fails *quietly* — there is no user staring at a blank screen. Three mechanisms close it, and
+all three ship here rather than being left as an exercise:
+
+- **A fallback ladder** (`remote/fallback.sh.template`). Per-invocation, never sticky: the primary
+  is tried every run, so the primary attempt *is* the availability check and the loop self-returns
+  when quota resets. The bottom rung is a flash-class seat at cents per run whose only job is to
+  keep the heartbeat alive and refuse to fabricate. Two token-plan seats can and do go dry in the
+  same window, so the ladder must end somewhere that cannot quota out.
+- **A three-leg dead-man** (`remote/deadman.yml.template` plus the heartbeat writer in the tick).
+  The loop reports on itself *including on failure*; something off the box parses that strictly and
+  fails closed; a local sidecar covers the wedged-but-alive case. On-box monitoring cannot report
+  that the box is gone.
+- **A staged idle gate.** The model writes its "nothing to do" assertion to a staging file and the
+  tick promotes it only on a clean exit, re-confirmed against a live health read. A run that
+  crashed has not earned the right to declare the queue empty.
+
+The design bias throughout: **prefer a cheap unconditional attempt over a clever probe.** Probes go
+stale, probes lie, and a probe against a thinking model is actively dangerous (`playbooks/
+continuity.md` §4). Trying the thing costs nothing when it works.
+
 ## 3. Sync: GitHub-native (no bespoke ledger)
 
 Each deployment instance is a **private clone of this repo = the control repo**. Coordination:
@@ -100,31 +126,24 @@ Each deployment instance is a **private clone of this repo = the control repo**.
 - **Journal** — the remote appends tick reports as comments on a pinned `journal` issue.
   Private repo ⇒ operational detail is safe; the "never post infra internals to public surfaces"
   rule still applies to all *public* target repos.
+- **Heartbeat** — one issue whose **body** the loop machine-edits each run (never a comment per run;
+  that is thousands of comments a month). Titled so humans leave it alone. The off-box dead-man
+  reads it.
+- **Ranked queue** — one small file in the target repo holding the current ordered priorities,
+  re-ranked in the same tick as any material change. The journal's "next" is a pointer at it. Two
+  competing lists is the failure this prevents: a plan that names a source of truth and then ranks
+  something else looks governed and is not.
 - **Work products** — PRs on the target project repos (committee-gated, driven to merge).
-- **Releases / CI** — optional per-project modules: the examples-freshness e2e gate and the
-  release-automation loop ship as reusable workflow templates in `sync/workflows/`.
 - ssh remains the break-glass path only; routine steering never needs it.
 
 ## 4. Install flow (the repo is the installer)
 
-`CLAUDE.md` routes a fresh Claude Code session into `skills/setup` — an interview:
-
-1. Which tier(s) to set up here?
-2. **Laptop**: install `agents/` → `~/.claude/agents/` and `bin/agent` → PATH; install prime-agent
-   and log it in to the **ChatGPT** subscription (explicitly *not* Claude — explain the billing);
-   render `prime/settings.json` + `prime/models.json`; verify codex and `gh` auth.
-3. **Remote**: ask for ssh target + tenant name + which harness drives the loop → provision
-   user/slice + toolchain (node, python3, tmux, gh, and the named harnesses) → auth dance, asking
-   only for what's missing: Claude credentials (Max, headless pattern), prime-agent `auth.json`
-   (log in on the laptop, copy at 600), codex auth, `gh` fine-grained PAT (scoping guidance baked
-   in: Contents/PRs/Issues write, Actions read, **no workflow scope**), OpenRouter key → write
-   `~/ops/secrets/*.env` (600) → seed the mission doc from `remote/mission.template.md` → install
-   the resident supervisor (prime) or the cron tick (claude) → `prime/bootstrap.py` to compile the
-   roster into the continual harness → run a **smoke run** end-to-end.
-4. `skills/doctor` — idempotent verification, re-runnable anytime: per-harness round-trips, model
-   probes per pool, `qwen3.8-max` present in `prime-agent model list`, resident alive + native
-   schedule registered + goal state sane, gh capability probes (push/PR/issue on the intended
-   repos), secrets permissions, directive round-trip (open a test issue → see it consumed).
+There is no scaffold ceremony and no separate skills tree: **`CLAUDE.md` is the installer, the
+doctor, and the manual.** Open an agent in the repo and say "set me up"; it runs the interview,
+provisions both tiers, and can re-run its doctor section idempotently at any time. The full step
+list lives there rather than being duplicated here — including the continuity install (fallback
+ladder, heartbeat issue, off-box dead-man) and the two drills that must pass before the deployment
+counts as done.
 
 ## 5. Guardrail catalog (shipped, parameterized per deployment)
 
@@ -136,30 +155,29 @@ Each deployment instance is a **private clone of this repo = the control repo**.
 - Prod-safety: never push to protected/prod branches; PR + human merge for designated repos.
 - Review discipline: **exercise the built artifact** (build it, run it from fresh, click it) —
   committee review + acceptance gates that run the real thing, not read the diff.
+- Governance floor: two live challengers of distinct lineage; no seat challenges itself or is its
+  own fallback; a decision is a proposal until objections are folded or refused with a reason.
+- Continuity floor: a fallback leg that cannot quota out, a heartbeat written even on failure, and
+  an off-box watcher that fails closed. All three drilled at install (`playbooks/continuity.md`).
 
-## 6. Build plan
+## 6. Keeping this kit current
 
-- **P0 — scaffold** (done, laptop): this design, example config, seeded `extracted/`.
-- **P1 — extract & generalize**: `extracted/*` → real kit locations; parameterize tick.sh
-  (paths/models/cadence from config; directive-aware idle-gate), generalize the mission template
-  (portal-ponder specifics out, template variables in), agents unchanged, peer CLI config-driven.
-- **P1b — harness-agnostic** (this branch): harness/pool catalogs; `bin/agent` replaces `bin/glm`
-  and enforces the Anthropic billing rule; prime-agent as the default executor with a resident
-  supervisor, native goal/schedule/gates, and `prime/bootstrap.py` compiling the roster into the
-  continual harness; roster prompts de-hardcoded to roles. Acceptance: `agent --list` green on a
-  fresh box, and a resident session consuming a directive with the laptop offline.
-- **P2 — setup + doctor skills**: the interview + verification, per §4. Acceptance: a fresh
-  container/VM reaches a green doctor from nothing but the repo + credentials.
-- **P3 — GitHub-native sync**: directive/journal conventions, labels, issue templates, the
-  tick fingerprint extension; workflow templates (freshness-gate, release-automation) in
-  `sync/workflows/`. Acceptance: a directive opened on the control repo is consumed by the next
-  tick and journaled, laptop fully offline.
-- **P4 — dogfood (the real acceptance)**: re-provision the existing OVH deployment as an
-  *instance of this kit* (new tenant beside the current one, then cut over). If the kit cannot
-  reproduce the deployment it was extracted from, it is not done.
+**The blueprint is downstream of the deployments.** Every time a live deployment improves its
+harness — a new fallback leg, a seat change, a sensor that turned out to lie, a cadence that had to
+move — the generalized form of that change belongs here, in the same pass. A lesson that stays in
+one deployment's private notes is a lesson the next deployment pays for again.
 
-Build owner: the remote (box) session, committee-gated PRs into this repo. The laptop scaffolded
-P0 and judges P4. Every phase lands as a PR with the standard evidence gates.
+Two hard rules for what lands:
+
+1. **Nothing project-specific, ever.** No hostnames, tenant names, repo names, issue numbers,
+   product details, infrastructure topology, or business context. If a rule cannot be stated without
+   naming the deployment that produced it, state the *mechanism* and drop the specifics — the
+   failure is the transferable part, not who suffered it. This repo is public.
+2. **Mechanism over anecdote.** Ship the template, the gate, or the check. Prose describing good
+   behaviour is the weakest form of this kit; a harness enforces a gate and only reads a paragraph.
+
+Acceptance bar, unchanged: **the kit must be able to re-provision the deployment it was extracted
+from.** If a running deployment has a mechanism this repo cannot reproduce, the repo is behind.
 
 ## 7. Non-goals (v1)
 
