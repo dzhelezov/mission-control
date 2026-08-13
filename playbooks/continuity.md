@@ -27,11 +27,22 @@ Design rules, each one learned the hard way:
   failure. Do not set a "degraded mode" flag. The primary attempt *is* the availability check: it
   costs nothing when healthy, it needs no probe, it cannot go stale, and the loop self-returns to
   the good seat on the first run after the quota resets.
-- **Pin every model slot in an env-swap config.** An OpenAI- or Anthropic-compatible proxy serves
-  whatever model ID you send it. If one CLI default leaks through — a "small/fast model" slot, a
-  summarizer slot — you will silently buy the expensive model through the expensive route. Set
-  every slot the harness reads, then **verify from the run transcript which model IDs actually went
-  out.** Do not trust the config; trust the transcript.
+- **Pin every model slot in an env-swap config.** A compatible proxy serves whatever model ID you
+  send it, and it fails in *both* directions. If one CLI default leaks through — a "small/fast
+  model" slot, a summarizer slot — you either silently buy the **expensive** model through the
+  expensive route, or, on shims that map unknown names to a house default, silently get a **cheaper,
+  weaker** model with no error at all. One vendor documents exactly that: unsupported model names
+  are mapped to its flash tier rather than rejected. Quality quietly drops and nothing looks wrong.
+  Set every slot the harness reads, then **verify from the run transcript which model IDs actually
+  went out.** Do not trust the config; trust the transcript.
+- **Set the context window explicitly for an unrecognised model.** A CLI that does not know the
+  model assumes a conservative window (200k is typical) and starts auto-compacting long before the
+  real limit — on a 1M-context model that silently throws away five sixths of your context, mid-run,
+  with only a startup warning to show for it. Pin it with the CLI's window override.
+- **Check whether the vendor's own API speaks your harness's protocol.** A model that is blocked or
+  marked up at a reseller is often reachable direct, on a separate balance — which is a whole extra
+  scarcity axis for free. It only works as a fallback leg if the vendor exposes the protocol your
+  loop's CLI actually speaks, so probe the exact path before designing around it.
 - **Use a scratch config directory per leg.** Most CLIs prefer a stored credentials file over the
   environment variable you just set. A leg that inherits the primary's config directory will
   cheerfully authenticate as the primary and report a confusing failure.

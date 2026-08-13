@@ -111,9 +111,18 @@ that happens "when someone notices" happens never. That applies to this page as 
 
 ## 6. Cost traps worth checking once
 
-- **Reasoning models bill for thinking.** An uncapped call to a thinking model can spend heavily and
-  return null content. Always set a token cap with headroom; the cap bounds thinking *and* answer
-  together.
+- **Reasoning models bill for thinking, and thinking is often ON by default.** An uncapped call can
+  spend heavily and return null content. Always set a token cap with headroom — and "headroom" means
+  thousands, not hundreds: a real analytical question drew ~31k characters of reasoning before the
+  answer began, so an 8k cap returned nothing *and still billed*. Counter-intuitively the larger cap
+  was **4x cheaper**, because the model finished naturally instead of burning the whole budget.
+  Where the vendor allows it, turn thinking off for mechanical work and keep it for judgment.
+- **Cache hits can be ~100x cheaper than cache misses.** One vendor prices cached input at $0.0036/M
+  against $0.435/M uncached. A loop that re-sends the same mission doc and repo context every cycle
+  is the ideal shape for this, so put the stable prefix first and check whether your pool bills it.
+- **Watch for time-of-day pricing.** At least one vendor bills peak hours at double off-peak. A loop
+  that ticks around the clock spends a predictable share at the higher rate; a routine you control
+  the schedule of should be placed off-peak.
 - **Effort levels are not free.** Running every seat at max effort is the same mistake as running
   everything on the best model. Match effort to class: bulk at low/high, judgment at xhigh/max.
 - **Never route a vendor's models through a reseller when you hold a first-party subscription.** You

@@ -124,6 +124,19 @@ scarcity     = "tokens"
 resets       = "weekly; a heavy loop can burn a week's plan in ~1 day"
 blast_radius = "this seat only"
 
+[pools.vendor-direct]
+# A vendor's OWN API, not a reseller. Often the only way to reach a model a reseller's data policy
+# blocks, and it is a genuinely independent pool: its own balance, its own outage, its own clock.
+# Check BOTH shapes — some vendors serve an OpenAI-compatible AND an Anthropic-compatible path from
+# the same key, and the Anthropic one is what lets a Claude-CLI-based loop use it as a fallback leg.
+billing      = "metered"
+harness      = "claude"          # via ANTHROPIC_BASE_URL, when the vendor exposes an Anthropic path
+provider     = "anthropic-compatible"
+base_url     = "https://api.your-vendor.example/anthropic"
+scarcity     = "dollars"
+resets       = "never — a prepaid balance"
+blast_radius = "this vendor only — which is the point: it shares no pool with the reseller seats"
+
 [pools.openrouter]
 billing          = "metered"   # real dollars per token; keep under [guardrails].metered_budget_usd
 harness          = "prime"

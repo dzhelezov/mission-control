@@ -28,6 +28,12 @@ cd {{PROJECT_DIR}} && git fetch -q origin && git checkout -q main && git pull -q
 # The off-box watcher (remote/deadman.yml.template) strict-parses this; keep the shape stable and
 # never add fields a strict consumer would choke on. See playbooks/continuity.md §2.
 CONSEC=$(cat "$OPS/state/.consec-fail" 2>/dev/null || echo 0)
+# Guard the VALUE, not just the read. `cat` on an existing-but-empty file succeeds and returns "",
+# so `|| echo 0` never fires and the printf below emits `"consec_fail":` — invalid JSON. The watcher
+# then fails closed and pages a human, for a loop that is perfectly healthy. An empty or truncated
+# state file is exactly what you get from a crash mid-write. (Found by a committee seat reviewing
+# this file; the same class as the rc:null false-positive — see playbooks/continuity.md §8.)
+case "$CONSEC" in ''|*[!0-9]*) CONSEC=0 ;; esac
 heartbeat() { # heartbeat <phase> <rc> <mode>
   mkdir -p "$OPS/state"
   local rec
@@ -138,7 +144,8 @@ fi
 # a run of them is an outage. Promote the staged idle assertion only on a clean exit.
 if [ $RC -eq 0 ]; then echo 0 > "$OPS/state/.consec-fail"
 else echo $((CONSEC + 1)) > "$OPS/state/.consec-fail"; rm -f "$OPS/.tick-idle-ok.staged"; fi
-CONSEC=$(cat "$OPS/state/.consec-fail")
+CONSEC=$(cat "$OPS/state/.consec-fail" 2>/dev/null || echo 0)
+case "$CONSEC" in ''|*[!0-9]*) CONSEC=0 ;; esac   # same guard: never emit a bare `"consec_fail":`
 heartbeat run_finished "$RC" "$MODE"
 
 # Exit with the RUN's status, not the heartbeat writer's. Without this the script returns whatever
