@@ -5,7 +5,8 @@ autonomous **remote resident session**, synced through GitHub-native primitives 
 directives, a pinned journal issue, PRs as work products).
 
 **Clone it, open Claude Code in it, say "set me up" — `CLAUDE.md` is the installer, doctor, and
-manual.** `orchestration.example.toml` holds the configuration as layers of data: a **harness**
+manual.** Already running something? Say **"adopt this deployment"** instead — `playbooks/adoption.md`
+compares an existing loop against the kit and produces a ranked migration, without installing anything. `orchestration.example.toml` holds the configuration as layers of data: a **harness**
 catalog (how a model is reached and who pays), a **pool** catalog (what runs out, when, and what it
 takes down with it), a **model** catalog (taste/cost/intelligence), a **role** schema (multi-seat
 committees, a brain+hands implementation pair, explicit escalation), a **dispatch** policy, and the

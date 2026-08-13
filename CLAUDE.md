@@ -1,5 +1,12 @@
 # mission-control
 
+> **First, which mode are you in?**
+> **If a deployment already exists here — a running loop, its own ledger/queue/mission doc — you are
+> in ADOPT mode. STOP and read `playbooks/adoption.md` instead of the setup sections below.** The
+> instructions here install a *new* deployment; run against a live one they will render templates
+> over working state and can clobber a loop mid-tick. Adoption never installs: it compares, ranks,
+> and migrates one mechanism at a time, and it ranks below the deployment's live delivery work.
+
 You are Claude Code, opened inside the mission-control kit. This repo installs and operates a
 two-tier orchestration: a **laptop gateway** (human-driven, intermittent — observes, steers,
 deep-dives, or takes over directly) and a **remote resident session** (24/7 autonomous executor
