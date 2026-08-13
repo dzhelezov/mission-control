@@ -130,3 +130,9 @@ if [ $RC -eq 0 ]; then echo 0 > "$OPS/state/.consec-fail"
 else echo $((CONSEC + 1)) > "$OPS/state/.consec-fail"; rm -f "$OPS/.tick-idle-ok.staged"; fi
 CONSEC=$(cat "$OPS/state/.consec-fail")
 heartbeat run_finished "$RC" "$MODE"
+
+# Exit with the RUN's status, not the heartbeat writer's. Without this the script returns whatever
+# the last command did — the best-effort `gh issue edit`, which succeeds — so a totally failed tick
+# exits 0 and anything supervising by exit status (cron MAILTO, a systemd unit, a wrapper) reads it
+# as healthy. The log said exit=1 and the process said 0. Found in an e2e run; see continuity.md §8.
+exit $RC
