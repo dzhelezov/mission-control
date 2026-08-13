@@ -172,9 +172,16 @@ So for any recurring obligation:
 - **Name the reviewer, and make it not the author.**
 - **Page when it is missing**, fail-closed, and prove the page fires by drilling a skipped cycle.
 - **Fix the agenda** so it does not degrade into whatever is on someone's mind.
+- **Require an artifact**, and treat *only* a produced artifact as evidence the cycle happened —
+  otherwise a crashing routine looks exactly like a healthy quiet one and the miss-page never fires.
 - **Place the slot deliberately.** Schedule a periodic review *after* the subscription reset, not
   before it: the hours before a reset are exactly when the primary seat is most likely dead, and a
   review that only lands in healthy weeks systematically misses the weeks worth reviewing.
+
+This is not advice to follow by hand — `remote/routine.sh.template` plus `[routines.*]` implements
+all six for the retro, the roadmap pass, seat re-election and catalog re-derivation, so the harness
+maintains itself rather than waiting for someone to rewrite its config. The bound that keeps that
+safe (**routines propose via PR, never self-apply**) is in `playbooks/self-improvement.md`.
 
 ## 7. Budget — measure the currency you actually depend on
 

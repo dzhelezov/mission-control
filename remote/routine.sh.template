@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# mission-control — CODED GOVERNANCE ROUTINE runner (rendered from routine.sh.template).
+#
+#   routine.sh <name>        # one entry per [routines.<name>] in orchestration.toml
+#
+# WHY THIS EXISTS: the retro, the roadmap pass, seat re-election and catalog re-derivation are all
+# things every deployment intends to do periodically and none of them do. A routine written in a doc
+# is followed once, on the day it is written. This runner gives each one the four things that make a
+# routine real — a CADENCE, a NAMED NON-AUTHOR REVIEWER, a FAIL-CLOSED PAGE when it does not happen,
+# and a DURABLE ARTIFACT — so the harness improves itself instead of waiting for a human to rewrite
+# its config. See playbooks/self-improvement.md.
+#
+# THE BOUND THAT MAKES THIS SAFE: a routine may PROPOSE changes to the harness — including to its own
+# roster, dispatch policy and governance — but it lands them as a PR, never as an in-place edit. A
+# loop that can silently rewrite its own review rules has no review rules. Merge is committee+human.
+set -uo pipefail
+
+NAME="${1:?routine name}"
+OPS={{OPS_DIR}}
+STATE="$OPS/state/routines"; mkdir -p "$STATE" "$OPS/runs/routines"
+STAMP=$(date -u +%Y%m%dT%H%M)
+LOG="$OPS/runs/routines/$NAME-$STAMP.log"
+say() { echo "$(date -u +%FT%TZ) [$NAME] $*" >> "$OPS/runs/routines/routines.log"; }
+
+exec 9>"$STATE/.$NAME.lock"; flock -n 9 || { say "already running, skipping"; exit 0; }
+
+# ---- config for this routine (rendered as a case block; keeps bash free of a TOML parser) --------
+# Each arm sets: CADENCE_S (how often it MUST run), REVIEWER (role, never the author), ARTIFACT,
+# PROPOSES (repo path this routine may open a PR against, empty = report-only), AGENDA (the prompt).
+case "$NAME" in
+{{ROUTINE_CASE_ARMS}}
+  *) say "unknown routine"; exit 64 ;;
+esac
+
+# ---- fail-closed: a routine that did NOT run is the failure mode we are guarding ----------------
+# Checked on every invocation, including the one that is about to run: if the previous run is older
+# than its cadence plus grace, that is a missed cycle and it pages. Drill this by moving the stamp
+# file back and confirming the page fires — an unfired page is not evidence of health.
+LAST_FILE="$STATE/$NAME.last"
+LAST=$(cat "$LAST_FILE" 2>/dev/null || echo 0)
+NOW=$(date +%s)
+GRACE=$(( CADENCE_S / 10 ))
+if [ "$LAST" -gt 0 ] && [ $(( NOW - LAST )) -gt $(( CADENCE_S + GRACE )) ]; then
+  MISSED_H=$(( (NOW - LAST) / 3600 ))
+  say "MISSED CYCLE — last ran ${MISSED_H}h ago, cadence $(( CADENCE_S / 3600 ))h"
+  [ -n "{{PAGE_CMD}}" ] && printf '%s\n' \
+    "🟠 ROUTINE-MISSED $(date -u +%FT%TZ): '$NAME' last ran ${MISSED_H}h ago against a $(( CADENCE_S / 3600 ))h cadence." \
+    | {{PAGE_CMD}} >/dev/null 2>&1
+fi
+
+# ---- run the pass -------------------------------------------------------------------------------
+# Routines go through the SAME fallback ladder as the tick: a governance routine that silently stops
+# running because a quota died is exactly the decoration this runner exists to prevent.
+PROMPT="Scheduled routine '$NAME'. Follow {{MISSION_DOC}}. AGENDA (fixed — work it in order, do not
+substitute your own):
+$AGENDA
+
+OUTPUT CONTRACT:
+- Write the artifact to $ARTIFACT. It must contain evidence and dated claims, not impressions.
+- State plainly what you could NOT verify. An honest gap beats a confident summary.
+- If this routine proposes harness changes and PROPOSES is set ($PROPOSES): open a PR against it.
+  NEVER edit governance, roster or dispatch policy in place — propose, and let the gate decide.
+- Then hand the artifact to the '$REVIEWER' seat for review (you are the author; you do not review
+  your own routine). Record its verdict in the artifact and act on blocking findings.
+- Journal a summary comment on the '{{CONTROL_REPO}}' issue titled 'journal', tagged [$NAME]."
+
+cd {{PROJECT_DIR}} || { say "bad cwd"; exit 90; }
+timeout {{ROUTINE_TIMEOUT_S}} claude -p "$PROMPT" \
+  --model {{MODEL_ID}} --effort {{ROUTINE_EFFORT}} --dangerously-skip-permissions > "$LOG" 2>&1
+RC=$?
+if [ $RC -ne 0 ] && [ -x "$OPS/fallback.sh" ]; then
+  "$OPS/fallback.sh" "$RC" "$LOG" "$PROMPT" && RC=0
+fi
+
+# ---- only a run that produced its artifact counts as having happened ----------------------------
+# Otherwise a crashing routine looks identical to a healthy one that had nothing to say, and the
+# missed-cycle page above never fires. The artifact IS the evidence of the cycle.
+if [ $RC -eq 0 ] && [ -s "$ARTIFACT" ]; then
+  echo "$NOW" > "$LAST_FILE"
+  say "OK artifact=$(basename "$ARTIFACT")"
+else
+  say "FAILED rc=$RC artifact_present=$([ -s "$ARTIFACT" ] && echo yes || echo no) — cycle NOT recorded"
+  [ -n "{{PAGE_CMD}}" ] && printf '%s\n' \
+    "🔴 ROUTINE-FAILED $(date -u +%FT%TZ): '$NAME' rc=$RC, no artifact. The cycle did not happen." \
+    | {{PAGE_CMD}} >/dev/null 2>&1
+fi
+exit $RC

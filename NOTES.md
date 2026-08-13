@@ -27,7 +27,7 @@ generalized mechanism.
 The remote tier installs onto **a fresh Linux box** or as **a new tenant (dedicated user +
 systemd slice) on an existing box** — isolated home, scoped sudoers, own secrets dir, own cron.
 
-## 2. Configuration is data (four layers, one file)
+## 2. Configuration is data (one file, layered)
 
 `orchestration.toml` — see `orchestration.example.toml` for the shipped defaults.
 
@@ -41,19 +41,25 @@ systemd slice) on an existing box** — isolated home, scoped sudoers, own secre
    judgment roles (cto, deep-reasoner), dispatch (orchestrator), implement (a *pair*: brain +
    hands), review (a *committee* with per-seat lenses + an arbiter), mechanical. Escalation
    rules (`when=`) are part of the schema.
-3. **Routing principles** — the policy that re-derives assignments when the catalog changes:
-   ship-quality ordering intel > taste > cost · taste ≥ 7 for anything that ships · judge the
-   output, not the price tag · volume → free/flat pools · judgment → the best brain · blind
-   multi-track for high-stakes. Stated in `CLAUDE.md` (*Routing principles*) so a future maintainer
-   can re-tune defaults by the same reasoning that produced them.
+3. **Dispatch policy** (`[dispatch]`) — capability floors per work class and an ordered candidate
+   list, so the role table above is a *derived answer* rather than a decree: ship-quality ordering
+   intel > taste > cost · taste ≥ 7 for anything that ships · judge the output, not the price tag ·
+   volume → cheap metered (to protect subscription rate caps) · judgment → the best brain. Method
+   and the monthly re-derivation in `playbooks/dispatch.md`.
+4. **Coded routines** (`[routines]`) — the retro, roadmap pass, catalog refresh and seat election,
+   each with cadence, non-author reviewer, fail-closed miss-page and an artifact. This is the layer
+   that keeps layers 1–3 from going stale on their own (`playbooks/self-improvement.md`).
 
 **Shipped defaults** (proven cost/value: Claude Max + ChatGPT sub + OpenRouter credits):
 fable = CTO/deep-reasoner (judgment); opus = orchestrator + escalation coder + committee-judgment
 seat; **implementation default = kimi-k3 (brain) + deepseek-v4-flash (hands)** — a frontier drafter
 over a near-free executor; **review = 4-seat committee** — kimi (taste + whole-repo) ∥ sol
-(adversarial-empirical) ∥ qwen3.8-max (independent lineage) ∥ opus (judgment, on substantive PRs)
-with fable as arbiter on splits; mechanical + compression → deepseek-v4-flash; long-context sweeps
-→ kimi-k3. glm-5.2 was the metered brain until 2026-08 and is now retired in favour of kimi-k3.
+(adversarial-empirical) ∥ glm-5.2 (conformance) ∥ kimi (taste + whole-repo) ∥ opus (judgment, on
+substantive PRs, failing over to glm when the plan is dry) with fable as arbiter on splits; mechanical + compression → deepseek-v4-flash; long-context sweeps
+→ kimi-k3; glm-5.2 as the cheap challenger and as the standing failover for the subscription
+seats — when the plan allowance is dry it is what keeps a challenger on the committee at all.
+Treat every one of these as a snapshot: `playbooks/dispatch.md` carries the method that re-derives
+them, and the catalog moves about monthly.
 
 ## 2b. Why two harnesses (the finding that shaped this kit)
 
@@ -74,10 +80,19 @@ Hence: harness is a config row, and exactly one guardrail is non-negotiable — 
 on the `claude` harness. `bin/agent` refuses otherwise unless `--allow-metered` is passed. This is
 the difference between "provider-agnostic" and "vendor-blind": the kit knows what each route costs.
 
-Second-order consequence worth stating: scarcity is now two-dimensional. Subscription pools are
-capped by *rate* (weekly caps that do get hit); metered pools are capped by *dollars*. Pushing
-volume onto a $0.09/M seat is not primarily about saving money — it is about keeping the
-subscription caps available for judgment work.
+Second-order consequence worth stating: scarcity is **three-dimensional**. Subscription pools are
+capped by *rate* (weekly caps that do get hit); prepaid vendor plans are capped by *tokens* on their
+own clock; metered pools are capped by *dollars* and do not reset at all. Pushing volume onto a
+$0.09/M seat is not primarily about saving money — it is about keeping the subscription caps
+available for judgment work.
+
+The axis matters more than the vendor, because **a fallback that does not cross the axis is not a
+fallback**: two rate-capped seats will be dry in the same window eventually, and eventually in the
+same hour. Pools therefore carry `scarcity`, `resets`, and `blast_radius` fields so "put the
+fallback on a different clock" is checkable rather than a matter of taste — and so the question
+"what does emptying this pool actually take down?" has a written answer before you find out. The
+allocation method across all three axes lives in `playbooks/dispatch.md`, and re-deriving it when
+prices move is a coded monthly routine rather than something anyone has to remember.
 
 ## 2c. Native over hand-rolled
 
@@ -113,6 +128,24 @@ all three ship here rather than being left as an exercise:
 The design bias throughout: **prefer a cheap unconditional attempt over a clever probe.** Probes go
 stale, probes lie, and a probe against a thinking model is actively dangerous (`playbooks/
 continuity.md` §4). Trying the thing costs nothing when it works.
+
+## 2e. Self-improvement is a subsystem, not a good intention
+
+The kit's own rule is that a standing routine with no cadence, owner and mechanical check is
+decoration — so the governance loop is coded rather than written down. `remote/routine.sh.template`
+plus `[routines.*]` runs the retro, the daily roadmap/issue pass, monthly catalog re-derivation, and
+monthly seat re-election, each with a non-author reviewer and a fail-closed page on a missed cycle.
+Only a produced artifact counts as a cycle having happened; otherwise a crashing routine is
+indistinguishable from a quiet healthy one and the miss-page never fires.
+
+That means the model roster and the dispatch policy are **derived artifacts refreshed on a cadence**,
+not static config a human maintains — which matters because catalogs and prices move about monthly,
+and the failure mode is silent: nothing breaks, you just overpay and under-perform for months.
+
+The bound: **routines propose via PR, never self-apply.** A harness that can rewrite its own
+governance has no governance, so every change to how the system judges itself arrives as a reviewable
+diff with a stated reason, gated by committee plus human. Same shape as the public-surface rule — the
+loop drafts, a gate publishes.
 
 ## 3. Sync: GitHub-native (no bespoke ledger)
 
